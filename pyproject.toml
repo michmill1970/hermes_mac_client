@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-mac-agent"
+version = "0.1.0"
+description = "Remote control agent for a MacBook Pro, driven by the Hermes agent over TLS WebSocket"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "websockets>=12.0",
+    "mss>=9.0",
+    "pyautogui>=0.9.54",
+    "psutil>=5.9",
+    "Pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+mcp = [
+    "mcp>=1.0",
+]
+menubar = [
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+    "pyinstaller>=6.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+hermes-mac-daemon = "hermes_mac_agent.daemon.server:main"
+hermes-mac-mcp = "hermes_mac_agent.mcp_adapter:main"
+hermes-mac-menubar = "hermes_mac_agent.menubar.app:main"
+
+[tool.setuptools.packages.find]
+include = ["hermes_mac_agent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "gui: tests that require a real macOS GUI session with TCC permissions granted",
+]
+testpaths = ["tests"]
+# GUI-input tests actually move the mouse / type on the Mac, so they are
+# excluded from the default run. Run them explicitly with:  pytest -m gui
+addopts = "-m 'not gui'"
