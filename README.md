@@ -1,6 +1,6 @@
 # hermes-mac-agent
 
-Remote-control agent for a **MacBook Pro**, driven by the **Hermes** agent over a
+Remote-control agent for a computer running **MacOS**, driven by the **Hermes** agent over a
 TLS-secured WebSocket. Hermes (running anywhere on your LAN) can:
 
 - **Read the screen** — capture any monitor as a PNG.
