@@ -12,6 +12,3 @@ venv/
 .coverage
 htmlcov/
 .DS_Store
-
-# local sync artifacts
-hmc.tar.gz
