@@ -646,10 +646,19 @@ def _tcc_hint(missing: list[str]) -> str:
     )
 
 
-def tool_health(params: dict[str, Any], config: Config, start_time: float) -> dict[str, Any]:
+def tool_health(
+    params: dict[str, Any],
+    config: Config,
+    start_time: float,
+    tracker: Any = None,
+) -> dict[str, Any]:
     screen = _screen_recording_granted()
     accessibility = _accessibility_granted()
     missing = [name for name, ok in (("screen", screen), ("accessibility", accessibility)) if not ok]
+    # This health() call is itself dispatched through _dispatch, so the tracker
+    # count includes it. Subtract 1 (clamped at 0) so the reported figures
+    # reflect the *other* in-flight calls, not this one.
+    in_flight = max(0, tracker.in_flight - 1) if tracker is not None else 0
     result: dict[str, Any] = {
         "ok": True,
         "uptime": round(time.monotonic() - start_time, 1),
@@ -657,6 +666,8 @@ def tool_health(params: dict[str, Any], config: Config, start_time: float) -> di
             "screen": screen,
             "accessibility": accessibility,
         },
+        "active": in_flight > 0,
+        "in_flight": in_flight,
     }
     if missing:
         result["tcc"] = {"missing": missing, "hint": _tcc_hint(missing)}
@@ -667,8 +678,9 @@ def tool_health(params: dict[str, Any], config: Config, start_time: float) -> di
 # Registry
 # ---------------------------------------------------------------------------
 
-def build_tools(config: Config, start_time: float) -> dict[str, Handler]:
-    """Map method name → handler, bound to *config* and daemon start time."""
+def build_tools(config: Config, start_time: float, tracker: Any = None) -> dict[str, Handler]:
+    """Map method name → handler, bound to *config*, daemon start time, and the
+    activity tracker (so ``health`` can report in-flight calls)."""
     return {
         "screenshot": tool_screenshot,
         "mouse_move": tool_mouse_move,
@@ -683,7 +695,7 @@ def build_tools(config: Config, start_time: float) -> dict[str, Handler]:
         "stop_process": tool_stop_process,
         "read_file": lambda p: tool_read_file(p, config),
         "write_file": lambda p: tool_write_file(p, config),
-        "health": lambda p: tool_health(p, config, start_time),
+        "health": lambda p: tool_health(p, config, start_time, tracker),
     }
 
 

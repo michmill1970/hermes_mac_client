@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import ssl
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -133,6 +134,8 @@ async def _dispatch(conn: Connection, ws: Any, raw: str | bytes, config: Config,
         return make_error_response(req.id, METHOD_NOT_FOUND, f"unknown method {req.method!r}")
 
     remote = getattr(ws, "remote_address", "?")
+    tracker = _config_holder.tracker
+    tracker.begin()
     try:
         result = await asyncio.wait_for(
             asyncio.to_thread(handler, req.params), timeout=DEFAULT_REQUEST_TIMEOUT
@@ -152,6 +155,8 @@ async def _dispatch(conn: Connection, ws: Any, raw: str | bytes, config: Config,
     except Exception as exc:  # noqa: BLE001 - report, don't crash the connection
         log.exception("tool %s failed", req.method)
         response = make_error_response(req.id, INTERNAL_ERROR, f"internal error: {exc}")
+    finally:
+        tracker.end()
 
     outcome = "ok" if not response.is_error else str(response.error.code)
     await asyncio.to_thread(_audit, "call", remote, req.method, req.params, outcome)
@@ -175,6 +180,40 @@ async def _handler(websocket: Any) -> None:
         log.info("connection closed: %s", remote)
 
 
+class ActivityTracker:
+    """Thread-safe count of in-flight tool calls.
+
+    The menubar host reads :attr:`active` to light up its icon while Hermes is
+    driving the Mac. ``begin``/``end`` are called from the daemon's dispatch
+    path (a worker thread); ``active`` is read from the UI thread, so all
+    access is guarded by a lock.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active = 0
+        self.last_activity = 0.0  # monotonic; 0.0 until the first call
+
+    def begin(self) -> None:
+        with self._lock:
+            self._active += 1
+            self.last_activity = time.monotonic()
+
+    def end(self) -> None:
+        with self._lock:
+            self._active = max(0, self._active - 1)
+
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._active > 0
+
+    @property
+    def in_flight(self) -> int:
+        with self._lock:
+            return self._active
+
+
 # Module-level holders so _handler/_dispatch share one config without
 # threading it through websockets' handler signature.
 class _ConfigHolder:
@@ -182,9 +221,19 @@ class _ConfigHolder:
         self.config: Config = Config()
         self.tools: dict = {}
         self.start_time: float = time.monotonic()
+        self.tracker = ActivityTracker()
 
 
 _config_holder = _ConfigHolder()
+
+
+def is_active() -> bool:
+    """Whether any authenticated tool call is currently in flight.
+
+    Public accessor for the menubar host (in-process). Safe to call before the
+    server has started (returns False).
+    """
+    return _config_holder.tracker.active
 
 
 async def start_server(config: Config, host: str | None = None, port: int | None = None) -> Server:
@@ -196,7 +245,8 @@ async def start_server(config: Config, host: str | None = None, port: int | None
             raise RuntimeError(f"missing TLS material: {path} — run scripts/setup_mac.sh")
 
     _config_holder.config = config
-    _config_holder.tools = build_tools(config, time.monotonic())
+    _config_holder.tracker = ActivityTracker()
+    _config_holder.tools = build_tools(config, time.monotonic(), _config_holder.tracker)
     _config_holder.start_time = time.monotonic()
 
     ssl_ctx = build_ssl_context(config)

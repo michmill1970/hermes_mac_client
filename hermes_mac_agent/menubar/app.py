@@ -31,7 +31,7 @@ import threading
 from typing import Any
 
 from hermes_mac_agent.daemon.config import CONFIG_DIR, Config
-from hermes_mac_agent.daemon.server import start_server
+from hermes_mac_agent.daemon.server import is_active, start_server
 from hermes_mac_agent.daemon.tools import (
     _accessibility_granted,
     _prompt_accessibility,
@@ -99,6 +99,14 @@ class ServerController:
             "screen": _screen_recording_granted(),
             "accessibility": _accessibility_granted(),
         }
+
+    def active(self) -> bool:
+        """Whether a tool call is in flight (drives the green menubar dot).
+
+        Reads the daemon's shared activity state in-process. Guarded by
+        ``self.running`` so a stopped daemon never reports active.
+        """
+        return self.running and is_active()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -177,6 +185,50 @@ def _open_path(path: str, reveal: bool = False) -> None:
     subprocess.run(cmd, check=False)
 
 
+_GREEN_DOT: Any = None
+
+
+def _green_dot() -> Any:
+    """A small non-template green dot image (built once, then cached).
+
+    Non-template (``setTemplate_(False)``) so macOS preserves the green color
+    instead of rendering it monochrome the way a status-item title is. Built at
+    runtime (no asset file) so the PyInstaller spec / build script are untouched.
+    """
+    global _GREEN_DOT
+    if _GREEN_DOT is not None:
+        return _GREEN_DOT
+    from AppKit import NSBezierPath, NSColor, NSImage
+    from Foundation import NSMakeRect, NSMakeSize
+
+    d = 14.0
+    img = NSImage.alloc().initWithSize_(NSMakeSize(d, d))
+    img.lockFocus()
+    NSColor.systemGreenColor().set()
+    NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(0, 0, d, d)).fill()
+    img.unlockFocus()
+    img.setTemplate_(False)
+    _GREEN_DOT = img
+    return img
+
+
+def _apply_icon(status_item, controller) -> bool:
+    """Set the status-item icon for the current activity state.
+
+    Green dot while a tool call is in flight; otherwise the monochrome ●/○
+    glyph. Returns the active state (so the caller can change-detect).
+    """
+    active = controller.active()
+    button = status_item.button()
+    if active:
+        button.setImage_(_green_dot())
+        button.setTitle_("")
+    else:
+        button.setImage_(None)
+        button.setTitle_("●" if controller.running else "○")
+    return active
+
+
 def main() -> None:
     """Launch the menubar app. macOS + pyobjc-framework-Cocoa required."""
     if sys.platform != "darwin":
@@ -211,11 +263,12 @@ def main() -> None:
         st = controller.status()
         perms = controller.perms()
 
+        # The status-item icon (●/○ glyph or green activity dot) is owned by
+        # the fast tickIcon_ timer via _apply_icon — not rebuilt here, so the
+        # 2s menu refresh never fights the icon over setTitle_/setImage_.
         if st["running"]:
-            status_item.button().setTitle_("●")
             _add_item(menu, target, f"Running on {st['host']}:{st['port']}", enabled=False)
         else:
-            status_item.button().setTitle_("○")
             detail = f"Stopped — {st['error']}" if st["error"] else "Stopped"
             _add_item(menu, target, detail, enabled=False)
 
@@ -269,9 +322,20 @@ def main() -> None:
             )
             NSRunLoop.currentRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
 
+            # Icon activity indicator: a fast timer (0.25s) swaps the
+            # monochrome ●/○ glyph for a green dot while a tool call is in
+            # flight. Kept separate from the 2s menu timer so the icon
+            # responds promptly without rebuilding the menu.
+            self._icon_active = None
+            icon_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.25, self, "tickIcon:", None, True
+            )
+            NSRunLoop.currentRunLoop().addTimer_forMode_(icon_timer, NSRunLoopCommonModes)
+
             # Auto-start the daemon; failures surface in the menu.
             controller.start()
             _rebuild_menu(self.status_item, self.menu, self)
+            self._icon_active = _apply_icon(self.status_item, controller)
 
             # TCC only shows its dialogs when the app *requests* a
             # permission (preflight checks never prompt). Ask for any
@@ -299,6 +363,15 @@ def main() -> None:
             if self._menu_open:
                 return
             _rebuild_menu(self.status_item, self.menu, self)
+
+        def tickIcon_(self, _timer) -> None:
+            # Only touch the icon when the activity state actually changed, so
+            # we don't churn setImage_/setTitle_ (and flicker) every 0.25s.
+            active = controller.active()
+            if active == self._icon_active:
+                return
+            self._icon_active = active
+            _apply_icon(self.status_item, controller)
 
         # -- actions ------------------------------------------------------
 

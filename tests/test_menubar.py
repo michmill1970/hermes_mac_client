@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_mac_agent.daemon import server
 from hermes_mac_agent.daemon.config import Config
 from hermes_mac_agent.menubar.app import ServerController
 
@@ -63,6 +64,25 @@ class TestServerController:
         assert not c.running
         assert c.status()["running"] is False
 
+    def test_stop_releases_port(self, config: Config) -> None:
+        # Exiting the app calls controller.stop(); verify that actually stops
+        # the daemon (the listening port is released), not just clears refs.
+        import socket
+
+        c = ServerController(config)
+        c.start()
+        port = c.status()["port"]
+        assert isinstance(port, int) and port > 0
+        c.stop()
+        assert not c.running
+        # The daemon's listening socket must be closed — we can bind the port.
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        finally:
+            s.close()
+
     def test_start_is_idempotent(self, config: Config) -> None:
         c = ServerController(config)
         c.start()
@@ -104,6 +124,23 @@ class TestServerController:
         perms = c.perms()
         assert set(perms) == {"screen", "accessibility"}
         assert all(isinstance(v, bool) for v in perms.values())
+
+    def test_active_tracks_in_flight(self, config: Config) -> None:
+        # The menubar reads the daemon's shared activity state in-process.
+        c = ServerController(config)
+        assert c.active() is False  # not started
+        c.start()
+        try:
+            assert c.active() is False  # running, idle
+            server._config_holder.tracker.begin()
+            try:
+                assert c.active() is True
+            finally:
+                server._config_holder.tracker.end()
+            assert c.active() is False
+        finally:
+            c.stop()
+        assert c.active() is False  # stopped
 
 
 class TestModuleImport:

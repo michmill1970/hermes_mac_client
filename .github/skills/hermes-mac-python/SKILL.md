@@ -79,7 +79,7 @@ the connection drops.
 | `read_file_text(path, encoding="utf-8")` | `str` | |
 | `write_file(path, data)` | `None` | offset 0 = create/truncate; ≤10 MB |
 | `write_file_text(path, text, encoding="utf-8")` | `None` | |
-| `health()` | `dict` | `{'ok','uptime','perms':{...}}` |
+| `health()` | `dict` | `{'ok','uptime','perms':{...},'active','in_flight'}` (+`tcc` if a perm is missing) |
 
 ## Error handling
 

@@ -94,8 +94,10 @@ open dist/HermesMacAgent.app
 
 The app shows a menu bar icon (● = running, ○ = stopped) with live status,
 permission state, Start/Stop, deep links into the right System Settings panes,
-and shortcuts to `config.json` / `audit.log`. It reads the **same**
-`~/.hermes_mac_agent/config.json` as the terminal daemon — run
+and shortcuts to `config.json` / `audit.log`. While any authenticated tool call
+is in flight, the icon switches to a **solid green dot** (steady, not blinking)
+for the duration of the call, then reverts to the monochrome glyph. It reads the
+**same** `~/.hermes_mac_agent/config.json` as the terminal daemon — run
 `./scripts/setup_mac.sh` first. The Hermes side is unchanged.
 
 > ⚠️ **Ad-hoc signing caveat:** TCC identity is derived from the code signature.
@@ -121,7 +123,10 @@ Verify:
 from hermes_mac_agent import MacAgent
 a = MacAgent("127.0.0.1", 8765, "<token>", ca_cert="~/.hermes_mac_agent/ca.pem")
 print(a.health())
-# {'ok': True, 'uptime': ..., 'perms': {'screen': True, 'accessibility': True}}
+# {'ok': True, 'uptime': ..., 'perms': {'screen': True, 'accessibility': True},
+#  'active': False, 'in_flight': 0}
+# `active`/`in_flight` reflect *other* in-flight calls (this health() call
+# excludes itself); a `tcc` key appears only when a permission is missing.
 ```
 
 ### On the Hermes host (the client)
@@ -309,8 +314,9 @@ pytest -m gui          # also run the mouse/keyboard tests (moves your real curs
 ```
 
 - **Unit tests** (`tests/test_protocol.py`, `tests/test_tools_unit.py`,
-  `tests/test_menubar.py`) — protocol parsing, policy matching, arg validation,
-  process tools, and the menubar `ServerController` (real daemon, no GUI needed).
+  `tests/test_menubar.py`, `tests/test_activity.py`) — protocol parsing, policy
+  matching, arg validation, process tools, the menubar `ServerController` (real
+  daemon, no GUI needed), and the activity tracker / green-dot wiring.
 - **System tests** (`tests/system/`) — spin up a **real daemon** in a background
   thread (self-signed cert, random token, ephemeral port) and drive it with a real
   `MacAgent` over TLS: auth gate, TLS handshake, allow/deny over the wire, process
