@@ -208,12 +208,84 @@ def _validate_button(button: Any) -> str:
     return button
 
 
+def _resolve_point(params: dict[str, Any], x_name: str = "x", y_name: str = "y") -> tuple[int, int]:
+    """Resolve a coordinate pair to global pixel coordinates for pyautogui.
+
+    Two modes:
+    - **int** values: global pixel coordinates (origin = top-left of primary
+      display; monitors left/above the primary use negative coordinates).
+    - **float** values in [0, 1]: percentage of the named monitor's screenshot.
+      The ``monitor`` param (default 1) selects which display the percentage
+      is relative to. The server converts to global pixels using the monitor's
+      geometry and the screenshot→click scale factor (handles Retina).
+    """
+    x = params.get(x_name)
+    y = params.get(y_name)
+
+    if (x is None) != (y is None):
+        raise ToolError(INVALID_PARAMS, f"'{x_name}' and '{y_name}' must be provided together")
+    if x is None:
+        raise ToolError(INVALID_PARAMS, f"'{x_name}' and '{y_name}' are required")
+
+    for name, val in ((x_name, x), (y_name, y)):
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            raise ToolError(
+                INVALID_PARAMS,
+                f"'{name}' must be a number (int = global pixels, float 0..1 = percentage of monitor)",
+            )
+
+    # Mode resolution (order matters):
+    # 1. Both ints → global pixels (original behavior).
+    if isinstance(x, int) and isinstance(y, int):
+        return (x, y)
+    # 2. Both in [0, 1] → percentage of the named monitor's screenshot.
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        pass  # percentage mode
+    # 3. Both integer-valued floats (e.g. 500.0 — JSON ints coerced to float
+    #    by MCP schema validation) → global pixels.
+    elif x == int(x) and y == int(y):
+        return (int(x), int(y))
+    # 4. Anything else mixes the two modes → reject.
+    else:
+        raise ToolError(
+            INVALID_PARAMS,
+            f"mixed coordinate modes: both '{x_name}' and '{y_name}' must be "
+            "percentages in [0, 1] or both (whole) pixel values",
+        )
+
+    monitor = params.get("monitor", 1)
+    if not isinstance(monitor, int) or isinstance(monitor, bool) or monitor < 1:
+        raise ToolError(INVALID_PARAMS, "'monitor' must be a positive integer (1 = primary)")
+
+    try:
+        from mss import MSS
+    except Exception as exc:
+        raise ToolError(INTERNAL_ERROR, f"mss unavailable: {exc}") from exc
+
+    with MSS() as sct:
+        if monitor >= len(sct.monitors):
+            raise ToolError(
+                INVALID_PARAMS,
+                f"monitor {monitor} does not exist (1..{len(sct.monitors) - 1})",
+            )
+        mon = sct.monitors[monitor]
+        virtual_w = sct.monitors[0]["width"]
+
+    # Scale: pyautogui click-space / mss screenshot-space (1.0 on scaled
+    # displays, 0.5 on unscaled Retina).
+    pa_size = _pyautogui().size()
+    scale = pa_size.width / virtual_w
+
+    px = int(round((mon["left"] + x * mon["width"]) * scale))
+    py = int(round((mon["top"] + y * mon["height"]) * scale))
+    return (px, py)
+
+
 def tool_mouse_move(params: dict[str, Any]) -> dict[str, Any]:
-    x = _int_param(params, "x")
-    y = _int_param(params, "y")
     duration = float(params.get("duration", 0.0))
+    px, py = _resolve_point(params, "x", "y")  # validates + converts before TCC
     _require_accessibility()
-    _pyautogui().moveTo(x, y, duration=duration)
+    _pyautogui().moveTo(px, py, duration=duration)
     return {"ok": True}
 
 
@@ -222,29 +294,26 @@ def tool_mouse_click(params: dict[str, Any]) -> dict[str, Any]:
     y = params.get("y")
     if (x is None) != (y is None):
         raise ToolError(INVALID_PARAMS, "'x' and 'y' must be provided together")
-    if x is not None:
-        x = _int_param(params, "x")
-        y = _int_param(params, "y")
     button = _validate_button(params.get("button", "left"))
     clicks = int(params.get("clicks", 1))
     if clicks < 1:
         raise ToolError(INVALID_PARAMS, "'clicks' must be >= 1")
+    if x is not None:
+        px, py = _resolve_point(params, "x", "y")  # validates + converts before TCC
     _require_accessibility()
     pa = _pyautogui()
     if x is not None:
-        pa.click(x, y, button=button, clicks=clicks)
+        pa.click(px, py, button=button, clicks=clicks)
     else:
         pa.click(button=button, clicks=clicks)
     return {"ok": True}
 
 
 def tool_mouse_drag(params: dict[str, Any]) -> dict[str, Any]:
-    x1 = _int_param(params, "x1")
-    y1 = _int_param(params, "y1")
-    x2 = _int_param(params, "x2")
-    y2 = _int_param(params, "y2")
     button = _validate_button(params.get("button", "left"))
     duration = float(params.get("duration", 0.5))
+    x1, y1 = _resolve_point(params, "x1", "y1")  # validates + converts before TCC
+    x2, y2 = _resolve_point(params, "x2", "y2")
     _require_accessibility()
     # Absolute drag: move to the start point, then drag to the end point.
     # pyautogui.drag() is *relative* to the current cursor position, so it

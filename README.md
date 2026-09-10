@@ -154,11 +154,15 @@ with agent:
     img = agent.screenshot()              # PIL.Image (RGB)
     png = agent.screenshot_bytes()        # raw PNG bytes
 
-    # Mouse — coordinates are global: origin (0,0) is the top-left of the
-    # PRIMARY display; monitors to the left/above it use negative coordinates.
-    agent.mouse_move(500, 300)
+    # Mouse — two coordinate modes:
+    #   int x/y   = global pixels (origin (0,0) = top-left of the PRIMARY
+    #               display; monitors left/above it use negative coordinates)
+    #   float x/y = percentage [0,1] of the `monitor`'s screenshot —
+    #               resolution-independent; the daemon converts to pixels.
+    # Take a screenshot, find the target as a fraction of the image, click.
+    agent.mouse_move(0.5, 0.5, monitor=1) # center of the primary display
     agent.mouse_click(500, 300)           # or mouse_click(button="right")
-    agent.mouse_drag(500, 300, 700, 400)
+    agent.mouse_drag(0.1, 0.1, 0.9, 0.9)  # corner-to-corner on monitor 1
     agent.mouse_scroll(dy=-3)
 
     # Keyboard

@@ -329,6 +329,150 @@ class TestGuiBehavior:
 
 
 # ---------------------------------------------------------------------------
+# Percentage (0..1) mouse coordinates → global pixel conversion
+# ---------------------------------------------------------------------------
+
+
+class TestPercentageCoordinates:
+    """Verify the pct→pixel math headless by stubbing both ``mss`` (monitor
+    geometry) and ``pyautogui`` (click space). Covers multi-monitor offsets
+    and Retina scale != 1.
+    """
+
+    def _stub(self, monkeypatch, monitors, click_width, click_height):
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        class _MSS:
+            def __init__(self):
+                self.monitors = monitors
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        mss_stub = types.ModuleType("mss")
+        mss_stub.MSS = _MSS
+        monkeypatch.setitem(sys.modules, "mss", mss_stub)
+
+        calls = []
+        pa = types.SimpleNamespace()
+        pa.size = lambda: types.SimpleNamespace(width=click_width, height=click_height)
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                calls.append((name, args, kwargs))
+            return _fn
+
+        for name in ("moveTo", "dragTo", "click"):
+            setattr(pa, name, _record(name))
+        monkeypatch.setitem(sys.modules, "pyautogui", pa)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        return calls
+
+    # Single 1000x800 primary; click space == screenshot space (scale 1.0).
+    MONITORS_1 = [
+        {"left": 0, "top": 0, "width": 1000, "height": 800},   # virtual
+        {"left": 0, "top": 0, "width": 1000, "height": 800},   # monitor 1
+    ]
+
+    def test_percentage_primary(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        tool_mouse_move({"x": 0.5, "y": 0.25})
+        assert calls[0][0] == "moveTo"
+        assert calls[0][1] == (500, 200)
+
+    def test_percentage_boundaries(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        tool_mouse_move({"x": 0.0, "y": 1.0})
+        assert calls[0][1] == (0, 800)
+
+    def test_percentage_secondary_monitor_offset(self, monkeypatch):
+        # Monitor 2 sits to the LEFT of the primary (negative global coords).
+        monitors = [
+            {"left": -1200, "top": 0, "width": 2200, "height": 800},  # virtual
+            {"left": 0, "top": 0, "width": 1000, "height": 800},      # monitor 1
+            {"left": -1200, "top": 0, "width": 1200, "height": 900},  # monitor 2
+        ]
+        calls = self._stub(monkeypatch, monitors, 2200, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_click
+
+        tool_mouse_click({"x": 0.5, "y": 0.5, "monitor": 2})
+        click = next(c for c in calls if c[0] == "click")
+        # -1200 + 0.5*1200 = -600 ; 0 + 0.5*900 = 450
+        assert click[1] == (-600, 450)
+
+    def test_percentage_retina_scale(self, monkeypatch):
+        # Unscaled Retina: mss reports 2x pixels, pyautogui clicks in points.
+        monitors = [
+            {"left": 0, "top": 0, "width": 3456, "height": 2232},  # virtual
+            {"left": 0, "top": 0, "width": 3456, "height": 2232},  # monitor 1
+        ]
+        calls = self._stub(monkeypatch, monitors, 1728, 1116)  # scale = 0.5
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        tool_mouse_move({"x": 0.5, "y": 0.5})
+        assert calls[0][1] == (864, 558)
+
+    def test_integer_valued_floats_are_pixels(self, monkeypatch):
+        # MCP schema validation coerces JSON ints to float (500 -> 500.0);
+        # whole-number floats must still mean global pixels, not percentages.
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        tool_mouse_move({"x": 500.0, "y": 300.0})
+        assert calls[0][1] == (500, 300)
+
+    def test_int_pixels_still_work(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        tool_mouse_move({"x": 500, "y": 300})
+        assert calls[0][1] == (500, 300)
+
+    def test_mixed_modes_rejected(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_move({"x": 0.5, "y": 500})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_out_of_range_percentage_rejected(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_move({"x": 1.5, "y": 0.5})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_bad_monitor_rejected(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_move
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_move({"x": 0.5, "y": 0.5, "monitor": 5})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_drag_percentages_both_endpoints(self, monkeypatch):
+        calls = self._stub(monkeypatch, self.MONITORS_1, 1000, 800)
+        from hermes_mac_agent.daemon.tools import tool_mouse_drag
+
+        tool_mouse_drag({"x1": 0.1, "y1": 0.1, "x2": 0.9, "y2": 0.9})
+        move = next(c for c in calls if c[0] == "moveTo")
+        drag = next(c for c in calls if c[0] == "dragTo")
+        assert move[1] == (100, 80)
+        assert drag[1] == (900, 720)
+
+
+# ---------------------------------------------------------------------------
 # File transfer (read_file / write_file)
 # ---------------------------------------------------------------------------
 

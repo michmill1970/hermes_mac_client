@@ -18,10 +18,35 @@ import time
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from hermes_mac_agent.daemon.config import Config
+
 HOME = pathlib.Path.home()
 TOKEN = json.loads((HOME / ".hermes_mac_agent/config.json").read_text())["token"]
 OUT = pathlib.Path("/tmp/hermes_mac_test")
 OUT.mkdir(parents=True, exist_ok=True)
+
+# Load the SAME policy config the running daemon uses, so the policy
+# assertions below match whatever allowlist/denylist is actually deployed
+# (rather than assuming a fixed one).
+_CFG = Config.load()
+
+
+def cmd_allowed(cmd: str) -> bool:
+    """Would the daemon's command policy permit *cmd*?"""
+    try:
+        _CFG.check_command(cmd)
+        return True
+    except Exception:
+        return False
+
+
+def path_allowed(path: str) -> bool:
+    """Would the daemon's file-transfer policy permit *path*?"""
+    try:
+        _CFG.check_path(path)
+        return True
+    except Exception:
+        return False
 
 BASE_ENV = {
     **os.environ,
@@ -172,10 +197,17 @@ async def run_suite(env_extra: dict, label: str) -> None:
                 ok, text, err = await call(session, "run_command", {"cmd": "sudo ls"})
                 check("run_command (sudo) BLOCKED by denylist",
                       not ok and ("blocked" in (text + err).lower()), (text + err)[:160])
-                # policy: allowlist must block unlisted commands
-                ok, text, err = await call(session, "run_command", {"cmd": "curl example.com"})
-                check("run_command (curl) BLOCKED by allowlist",
-                      not ok and ("blocked" in (text + err).lower()), (text + err)[:160])
+                # policy: curl is permitted only if the command allowlist allows it
+                if cmd_allowed("curl example.com"):
+                    ok, text, err = await call(session, "run_command", {"cmd": "curl example.com"})
+                    # ok=True means the tool ran (not blocked); we don't require
+                    # network success, only that the allowlist didn't block it.
+                    check("run_command (curl) ALLOWED by allowlist",
+                          ok, text[:120] or err[:120])
+                else:
+                    ok, text, err = await call(session, "run_command", {"cmd": "curl example.com"})
+                    check("run_command (curl) BLOCKED by allowlist",
+                          not ok and ("blocked" in (text + err).lower()), (text + err)[:160])
             else:
                 ok, text, err = await call(session, "run_command", {"cmd": "echo hi"})
                 check("run_command GATED (no env var)",
@@ -197,21 +229,31 @@ async def run_suite(env_extra: dict, label: str) -> None:
 
             # 9. file transfer (gated on) --------------------------------
             if "HERMES_MAC_ALLOW_FILE_TRANSFER" in env:
-                payload = "hello from the AI agent\n"
-                b64 = base64.b64encode(payload.encode()).decode()
-                ok, text, err = await call(session, "write_file",
-                                           {"path": "/tmp/hermes_mac_test/hello.txt",
-                                            "data_base64": b64})
-                check("write_file", ok, text[:120] or err[:120])
-                ok, text, err = await call(session, "read_file",
-                                           {"path": "/tmp/hermes_mac_test/hello.txt"})
-                roundtrip = base64.b64decode(text).decode() if ok else ""
-                check("read_file (roundtrip)", ok and roundtrip == payload,
-                      repr(roundtrip[:60]) or err[:120])
-                # policy: file_denylist/allowlist must block /etc/passwd
-                ok, text, err = await call(session, "read_file", {"path": "/etc/passwd"})
-                check("read_file (/etc/passwd) BLOCKED",
-                      not ok and "blocked" in (text + err).lower(), (text + err)[:160])
+                test_path = "/tmp/hermes_mac_test/hello.txt"
+                if path_allowed(test_path):
+                    payload = "hello from the AI agent\n"
+                    b64 = base64.b64encode(payload.encode()).decode()
+                    ok, text, err = await call(session, "write_file",
+                                               {"path": test_path, "data_base64": b64})
+                    check("write_file", ok, text[:120] or err[:120])
+                    ok, text, err = await call(session, "read_file", {"path": test_path})
+                    roundtrip = base64.b64decode(text).decode() if ok else ""
+                    check("read_file (roundtrip)", ok and roundtrip == payload,
+                          repr(roundtrip[:60]) or err[:120])
+                else:
+                    # config's file_allowlist doesn't cover the test path -> must be blocked
+                    ok, text, err = await call(session, "write_file",
+                                               {"path": test_path,
+                                                "data_base64": base64.b64encode(b"x").decode()})
+                    check("write_file BLOCKED by file_allowlist",
+                          not ok and "blocked" in (text + err).lower(), (text + err)[:160])
+                # policy: /etc/passwd must be blocked unless explicitly allowed
+                if path_allowed("/etc/passwd"):
+                    skip("read_file (/etc/passwd)", "config allows /etc/passwd - not asserting block")
+                else:
+                    ok, text, err = await call(session, "read_file", {"path": "/etc/passwd"})
+                    check("read_file (/etc/passwd) BLOCKED",
+                          not ok and "blocked" in (text + err).lower(), (text + err)[:160])
             else:
                 ok, text, err = await call(session, "read_file", {"path": "/tmp/x"})
                 check("read_file GATED (no env var)",

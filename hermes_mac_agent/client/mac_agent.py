@@ -298,24 +298,41 @@ class MacAgent:
     # Mouse
     # ------------------------------------------------------------------
 
-    def mouse_move(self, x: int, y: int, duration: float = 0.0) -> None:
-        """Move the mouse to absolute global screen coordinates.
+    def mouse_move(self, x: int | float, y: int | float, duration: float = 0.0, monitor: int = 1) -> None:
+        """Move the mouse to a screen position.
 
-        The origin (0, 0) is the top-left of the PRIMARY display; monitors
-        positioned to the left or above the primary use negative coordinates.
+        Two coordinate modes:
+        - **int** x/y: global pixel coordinates. The origin (0, 0) is the
+          top-left of the PRIMARY display; monitors positioned to the left or
+          above the primary use negative coordinates.
+        - **float** x/y in [0, 1]: percentage of the *monitor*'s screenshot
+          (``monitor=1`` is the primary display). The daemon converts to
+          pixels, so this is resolution- and Retina-safe. Use this when the
+          target was located in a screenshot.
         """
-        self._invoke("mouse_move", {"x": x, "y": y, "duration": duration})
+        self._invoke("mouse_move", {"x": x, "y": y, "duration": duration, "monitor": monitor})
 
-    def mouse_click(self, x: int | None = None, y: int | None = None, button: str = "left", clicks: int = 1) -> None:
-        params: dict[str, Any] = {"button": button, "clicks": clicks}
+    def mouse_click(self, x: int | float | None = None, y: int | float | None = None, button: str = "left", clicks: int = 1, monitor: int = 1) -> None:
+        """Click the mouse, optionally at a screen position.
+
+        See :meth:`mouse_move` for the two coordinate modes (global pixels vs.
+        percentage of a monitor's screenshot). Omit x/y to click at the
+        current cursor position.
+        """
+        params: dict[str, Any] = {"button": button, "clicks": clicks, "monitor": monitor}
         if x is not None:
             params["x"] = x
         if y is not None:
             params["y"] = y
         self._invoke("mouse_click", params)
 
-    def mouse_drag(self, x1: int, y1: int, x2: int, y2: int, button: str = "left", duration: float = 0.5) -> None:
-        self._invoke("mouse_drag", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "button": button, "duration": duration})
+    def mouse_drag(self, x1: int | float, y1: int | float, x2: int | float, y2: int | float, button: str = "left", duration: float = 0.5, monitor: int = 1) -> None:
+        """Drag from (x1, y1) to (x2, y2).
+
+        See :meth:`mouse_move` for the two coordinate modes. In percentage
+        mode both endpoints are relative to the same *monitor*.
+        """
+        self._invoke("mouse_drag", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "button": button, "duration": duration, "monitor": monitor})
 
     def mouse_scroll(self, dx: int = 0, dy: int = 0) -> None:
         self._invoke("mouse_scroll", {"dx": dx, "dy": dy})

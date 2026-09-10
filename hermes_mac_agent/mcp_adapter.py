@@ -101,31 +101,46 @@ def build_mcp_server():
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
     @mcp.tool()
-    def mouse_move(x: int, y: int, duration: float = 0.0) -> str:
-        """Move the mouse to absolute screen coordinates.
+    def mouse_move(x: float, y: float, duration: float = 0.0, monitor: int = 1) -> str:
+        """Move the mouse to a screen position.
 
-        Coordinates are in the global virtual-screen space: origin (0, 0) is
-        the top-left of the PRIMARY display. Monitors positioned to the left
-        or above the primary have NEGATIVE coordinates. To click a pixel in a
-        single monitor's screenshot, add that monitor's offset (e.g. a
-        monitor whose left edge is at x=-5120: image pixel (100, 100) ->
-        global (-5020, 100)).
+        PREFERRED: pass x and y as PERCENTAGES in [0, 1] relative to the
+        screenshot of `monitor` (0.0 = left/top edge, 1.0 = right/bottom
+        edge). This is resolution-independent and works across displays of
+        different sizes — take a screenshot of the monitor, find the target
+        as a fraction of the image width/height, and pass that here.
+
+        Alternatively pass x and y as integers for global pixel coordinates
+        (origin = top-left of the primary display; monitors left/above the
+        primary use negative coordinates).
         """
-        agent.mouse_move(x, y, duration=duration)
+        agent.mouse_move(x, y, duration=duration, monitor=monitor)
         return "ok"
 
     @mcp.tool()
-    def mouse_click(x: int | None = None, y: int | None = None, button: str = "left", clicks: int = 1) -> str:
-        """Click the mouse, optionally at absolute global screen coordinates
-        (see mouse_move for the multi-monitor coordinate space)."""
-        agent.mouse_click(x=x, y=y, button=button, clicks=clicks)
+    def mouse_click(x: float | None = None, y: float | None = None, button: str = "left", clicks: int = 1, monitor: int = 1) -> str:
+        """Click the mouse, optionally at a screen position.
+
+        PREFERRED: pass x and y as PERCENTAGES in [0, 1] relative to the
+        screenshot of `monitor` (0.0 = left/top edge, 1.0 = right/bottom
+        edge). Take a screenshot of the monitor, locate the target as a
+        fraction of the image, and click there. Omit x/y to click at the
+        current cursor position.
+
+        Alternatively pass integers for global pixel coordinates (see
+        mouse_move)."""
+        agent.mouse_click(x=x, y=y, button=button, clicks=clicks, monitor=monitor)
         return "ok"
 
     @mcp.tool()
-    def mouse_drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> str:
-        """Drag the mouse from (x1, y1) to (x2, y2) in global screen
-        coordinates (see mouse_move for the multi-monitor coordinate space)."""
-        agent.mouse_drag(x1, y1, x2, y2, button=button)
+    def mouse_drag(x1: float, y1: float, x2: float, y2: float, button: str = "left", monitor: int = 1) -> str:
+        """Drag the mouse from (x1, y1) to (x2, y2).
+
+        PREFERRED: pass all four values as PERCENTAGES in [0, 1] relative to
+        the screenshot of `monitor`. Both endpoints are in the same monitor's
+        coordinate space. Alternatively pass integers for global pixel
+        coordinates (see mouse_move)."""
+        agent.mouse_drag(x1, y1, x2, y2, button=button, monitor=monitor)
         return "ok"
 
     @mcp.tool()

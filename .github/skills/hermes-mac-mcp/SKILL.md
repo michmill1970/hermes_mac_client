@@ -65,10 +65,18 @@ All tools return **strings** (MCP-friendly). `screenshot` returns base64-encoded
 | Tool | Args | Returns |
 |---|---|---|
 | `screenshot` | `monitor=1` (`0`=all) | base64 PNG |
-| `mouse_move` | `x, y, duration=0.0` | `"ok"` |
-| `mouse_click` | `x, y, button="left", clicks=1` | `"ok"` |
-| `mouse_drag` | `x1, y1, x2, y2, button="left"` | `"ok"` |
+| `mouse_move` | `x, y, duration=0.0, monitor=1` | `"ok"` |
+| `mouse_click` | `x, y, button="left", clicks=1, monitor=1` | `"ok"` |
+| `mouse_drag` | `x1, y1, x2, y2, button="left", monitor=1` | `"ok"` |
 | `mouse_scroll` | `dx=0, dy=0` | `"ok"` |
+
+**Mouse coordinates — prefer percentages.** Pass `x`/`y` as floats in [0,1]
+relative to the `monitor`'s screenshot (0.0 = left/top edge, 1.0 = right/bottom
+edge). Workflow: `screenshot(monitor=N)` → locate the target as a fraction of
+the image → `mouse_click(x, y, monitor=N)`. This is resolution-independent and
+works across displays of different sizes. Integers are also accepted as global
+pixels (origin = top-left of the primary display; monitors left/above it use
+negative coordinates). Don't mix int and float in one call.
 | `type_text` | `text, interval=0.0` | `"ok"` |
 | `key_press` | `keys` (list, e.g. `["command","t"]`) | `"ok"` |
 | `launch_app` | `app, url=None` | `"launched <app> (pid=<pid>)"` |

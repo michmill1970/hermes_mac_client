@@ -39,7 +39,8 @@ agent = MacAgent(
 
 with agent:
     img = agent.screenshot()              # PIL.Image (RGB)
-    agent.mouse_click(500, 300)           # button="left"|"right"|"middle"
+    agent.mouse_click(500, 300)           # global pixels; button="left"|"right"|"middle"
+    agent.mouse_click(0.5, 0.5)           # OR percentage of monitor 1's screenshot
     agent.type_text("hello")
     agent.key_press(["command", "t"])     # hotkey combo
     agent.launch_app("Safari", url="https://www.linkedin.com")
@@ -65,10 +66,19 @@ the connection drops.
 |---|---|---|
 | `screenshot(monitor=1)` | `PIL.Image` | `monitor=0` = all monitors |
 | `screenshot_bytes(monitor=1)` | `bytes` | raw PNG |
-| `mouse_move(x, y, duration=0.0)` | `None` | |
-| `mouse_click(x, y, button="left", clicks=1)` | `None` | `x` and `y` must be given together |
-| `mouse_drag(x1, y1, x2, y2, ...)` | `None` | |
+| `mouse_move(x, y, duration=0.0, monitor=1)` | `None` | int = global pixels; float [0,1] = % of `monitor`'s screenshot |
+| `mouse_click(x, y, button="left", clicks=1, monitor=1)` | `None` | `x` and `y` must be given together; same two modes |
+| `mouse_drag(x1, y1, x2, y2, ..., monitor=1)` | `None` | both endpoints in the same mode |
 | `mouse_scroll(dx=0, dy=0)` | `None` | negative `dy` scrolls down |
+
+**Mouse coordinates — two modes.** `int` x/y are global pixels: origin (0,0) is
+the top-left of the PRIMARY display, monitors left/above it use negative
+coordinates. `float` x/y in [0,1] are percentages of the `monitor`'s screenshot
+(0.0 = left/top edge, 1.0 = right/bottom edge); the daemon converts to pixels,
+so this is resolution- and Retina-safe. **Prefer percentages when the target
+was located in a screenshot** — take a screenshot of the monitor, express the
+target as a fraction of the image, and pass that. Don't mix int and float in
+one call.
 | `type_text(text, interval=0.0)` | `None` | |
 | `key_press(keys)` | `None` | list of key names, e.g. `["command","shift","3"]` |
 | `launch_app(app, url=None)` | `int \| None` | pid if it could be found, else `None` |
