@@ -269,12 +269,19 @@ def _resolve_point(params: dict[str, Any], x_name: str = "x", y_name: str = "y")
                 f"monitor {monitor} does not exist (1..{len(sct.monitors) - 1})",
             )
         mon = sct.monitors[monitor]
-        virtual_w = sct.monitors[0]["width"]
+        # monitors[0] is the *virtual* (all-displays) screen; monitors[1] is
+        # the primary display. pyautogui.size() reports the PRIMARY display's
+        # size, so the screenshot→click scale must be derived from the
+        # primary, not the virtual screen. Using the virtual width (the old
+        # code) made the scale < 1 on multi-display setups and squished every
+        # percentage click toward the origin, so clicks on secondary displays
+        # missed their target.
+        primary_w = sct.monitors[1]["width"]
 
-    # Scale: pyautogui click-space / mss screenshot-space (1.0 on scaled
-    # displays, 0.5 on unscaled Retina).
+    # Scale: pyautogui click-space / mss screenshot-space, derived from the
+    # primary display (1.0 on scaled displays, 0.5 on unscaled Retina).
     pa_size = _pyautogui().size()
-    scale = pa_size.width / virtual_w
+    scale = pa_size.width / primary_w
 
     px = int(round((mon["left"] + x * mon["width"]) * scale))
     py = int(round((mon["top"] + y * mon["height"]) * scale))

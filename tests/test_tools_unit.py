@@ -396,18 +396,42 @@ class TestPercentageCoordinates:
 
     def test_percentage_secondary_monitor_offset(self, monkeypatch):
         # Monitor 2 sits to the LEFT of the primary (negative global coords).
+        # pyautogui.size() reports the PRIMARY display (monitor 1, 1000 wide),
+        # NOT the virtual screen (2200 wide) — so click_width is the primary's
+        # width and the scale is 1000/1000 = 1.0.
         monitors = [
             {"left": -1200, "top": 0, "width": 2200, "height": 800},  # virtual
-            {"left": 0, "top": 0, "width": 1000, "height": 800},      # monitor 1
+            {"left": 0, "top": 0, "width": 1000, "height": 800},      # monitor 1 (primary)
             {"left": -1200, "top": 0, "width": 1200, "height": 900},  # monitor 2
         ]
-        calls = self._stub(monkeypatch, monitors, 2200, 800)
+        calls = self._stub(monkeypatch, monitors, 1000, 800)  # primary click size
         from hermes_mac_agent.daemon.tools import tool_mouse_click
 
         tool_mouse_click({"x": 0.5, "y": 0.5, "monitor": 2})
         click = next(c for c in calls if c[0] == "click")
-        # -1200 + 0.5*1200 = -600 ; 0 + 0.5*900 = 450
+        # scale = 1000/1000 = 1.0 ; -1200 + 0.5*1200 = -600 ; 0 + 0.5*900 = 450
         assert click[1] == (-600, 450)
+
+    def test_multi_display_scale_uses_primary_not_virtual(self, monkeypatch):
+        # Regression for the multi-display miss: with several displays the
+        # virtual screen is far wider than the primary. pyautogui.size()
+        # returns the PRIMARY size, so the scale must be
+        # primary_click/primary_screenshot (1.0 here), not
+        # primary_click/virtual_screenshot (0.25) — the latter squished clicks
+        # on secondary displays toward the origin and made them miss.
+        monitors = [
+            {"left": -5120, "top": 0, "width": 6848, "height": 1440},  # virtual
+            {"left": 0, "top": 0, "width": 1728, "height": 1117},      # monitor 1 (primary)
+            {"left": -5120, "top": 0, "width": 2560, "height": 1440},  # monitor 2
+        ]
+        calls = self._stub(monkeypatch, monitors, 1728, 1117)  # primary click size
+        from hermes_mac_agent.daemon.tools import tool_mouse_click
+
+        # Center of monitor 2.
+        tool_mouse_click({"x": 0.5, "y": 0.5, "monitor": 2})
+        click = next(c for c in calls if c[0] == "click")
+        # scale = 1728/1728 = 1.0 ; -5120 + 0.5*2560 = -3840 ; 0 + 0.5*1440 = 720
+        assert click[1] == (-3840, 720)
 
     def test_percentage_retina_scale(self, monkeypatch):
         # Unscaled Retina: mss reports 2x pixels, pyautogui clicks in points.
