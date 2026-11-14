@@ -390,8 +390,17 @@ class MacAgent:
           above the primary use negative coordinates.
         - **float** x/y in [0, 1]: percentage of the *monitor*'s screenshot
           (``monitor=1`` is the primary display). The daemon converts to
-          pixels, so this is resolution- and Retina-safe. Use this when the
-          target was located in a screenshot.
+          integer pixel coordinates, so this is resolution- and Retina-safe.
+          Use this when the target was located in a screenshot.
+
+        Percentage precision: compute the fraction from the **full-resolution
+        saved screenshot** (never a resized display copy) and pass it with at
+        least 5 decimal places — or full float precision, which is preferred::
+
+            x_pct, y_pct = x_px / img.width, y_px / img.height
+
+        Rounding to 2-3 decimals silently shifts the click by several pixels
+        (0.001 * 1792px = ~1.8px) and misses small targets.
         """
         self._invoke("mouse_move", {"x": x, "y": y, "duration": duration, "monitor": monitor})
 
@@ -418,6 +427,13 @@ class MacAgent:
         self._invoke("mouse_drag", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "button": button, "duration": duration, "monitor": monitor})
 
     def mouse_scroll(self, dx: int = 0, dy: int = 0) -> None:
+        """Scroll at the CURRENT cursor position.
+
+        Scroll events target whatever pane is under the pointer — move the
+        mouse onto the intended pane (and take a confirming screenshot)
+        first; the daemon adds a settle gap between calls for exactly this
+        move-then-scroll ordering.
+        """
         self._invoke("mouse_scroll", {"dx": dx, "dy": dy})
 
     # ------------------------------------------------------------------
@@ -425,10 +441,24 @@ class MacAgent:
     # ------------------------------------------------------------------
 
     def type_text(self, text: str, interval: float = 0.0) -> None:
+        """Type text with the keyboard.
+
+        ``interval`` is the per-character delay in seconds. The daemon
+        enforces a pacing floor (~0.02s): machine-speed bursts of key
+        events are partially dropped on a loaded macOS, so larger values
+        are honored but zero is raised to the floor. Verify the text
+        landed (screenshot / field readout) before continuing.
+        """
         self._invoke("type_text", {"text": text, "interval": interval})
 
     def key_press(self, keys: list[str]) -> None:
-        """Press a hotkey combination, e.g. ``["command", "t"]``."""
+        """Press a hotkey combination, e.g. ``["command", "t"]``.
+
+        Events are paced (modifiers down → key → modifiers up with settle
+        gaps, releases guaranteed). Avoid bare ``["ctrl"]``/``["fn"]``
+        presses: on macOS a double-Control tap opens the Dictation dialog
+        and the Globe/Fn key opens the Character Viewer.
+        """
         self._invoke("key_press", {"keys": keys})
 
     # ------------------------------------------------------------------
