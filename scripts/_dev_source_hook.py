@@ -23,6 +23,22 @@ import os
 import sys
 
 
+def _log(msg: str) -> None:
+    # A --windowed PyInstaller bundle swallows Python-level stderr, so the
+    # hook's activity is recorded to a log file next to the marker.
+    try:
+        with open(os.path.join(
+            os.environ.get("HERMES_MAC_AGENT_HOME")
+            or os.path.expanduser("~/.hermes_mac_agent"),
+            "dev_source.log",
+        ), "a", encoding="utf-8") as fh:
+            import datetime
+
+            fh.write(f"{datetime.datetime.now().isoformat()} {msg}\n")
+    except OSError:
+        pass
+
+
 def _apply() -> None:
     config_dir = os.environ.get("HERMES_MAC_AGENT_HOME") or os.path.expanduser(
         "~/.hermes_mac_agent"
@@ -37,9 +53,9 @@ def _apply() -> None:
         return
     pkg = os.path.join(root, "hermes_mac_agent", "__init__.py")
     if not os.path.isfile(pkg):
-        sys.stderr.write(
-            f"[hermes-mac dev_source] marker {marker} points at {root!r}, "
-            "which has no hermes_mac_agent package; ignoring\n"
+        _log(
+            f"marker {marker} points at {root!r}, which has no "
+            "hermes_mac_agent package; ignoring"
         )
         return
     if root not in sys.path:
@@ -55,9 +71,7 @@ def _apply() -> None:
             sys.meta_path.insert(0, PathFinder)
     except ImportError:
         pass
-    sys.stderr.write(
-        f"[hermes-mac dev_source] importing hermes_mac_agent from {root}\n"
-    )
+    _log(f"importing hermes_mac_agent from {root}")
 
 
 _apply()
