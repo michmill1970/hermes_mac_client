@@ -16,6 +16,13 @@
 #     rebuilds, sign with a Developer ID certificate instead:
 #       codesign --force --deep --sign "Developer ID Application: <Name>" \
 #         dist/HermesMacAgent.app
+#   * Dev/debug loop WITHOUT losing grants: the bundle loads a runtime hook
+#     (scripts/_dev_source_hook.py) that imports hermes_mac_agent from a
+#     plain source tree when the file ~/.hermes_mac_agent/dev_source exists
+#     and contains the repo checkout root. The bundle binary is untouched,
+#     so its cdhash — and the TCC grants — survive code edits; you can
+#     iterate on daemon code without ever re-granting. No marker file =
+#     production behaviour (embedded code).
 #   * The app reads the same ~/.hermes_mac_agent/config.json as the terminal
 #     daemon — run ./scripts/setup_mac.sh first.
 #
@@ -49,6 +56,7 @@ echo "==> Building HermesMacAgent.app (PyInstaller)"
   --hidden-import "HIServices" \
   --hidden-import "ApplicationServices" \
   --collect-submodules "hermes_mac_agent" \
+  --runtime-hook "scripts/_dev_source_hook.py" \
   hermes_mac_agent/menubar/__main__.py
 
 APP="dist/HermesMacAgent.app"
