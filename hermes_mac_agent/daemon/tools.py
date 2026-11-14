@@ -31,6 +31,7 @@ from hermes_mac_agent.protocol import (
     FILE_CHUNK_SIZE,
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    MAX_COMMAND_TIMEOUT,
     MAX_FILE_SIZE,
     PROCESS_NOT_FOUND,
     TCC_PERMISSION_DENIED,
@@ -415,10 +416,10 @@ def _find_app_pid(app: str) -> int | None:
     return None
 
 
-# Hard cap on the client-supplied command timeout. The server's per-request
-# timeout is 120s; a child must never be allowed to outlive the daemon's ability
-# to reap it, so we clamp the client value into a sane range.
-MAX_COMMAND_TIMEOUT = 300.0
+# MAX_COMMAND_TIMEOUT (protocol.py) is the hard cap on the client-supplied
+# command timeout. The server's per-request cap (DEFAULT_REQUEST_TIMEOUT) must
+# exceed it; a child must never outlive the daemon's ability to reap it, so we
+# clamp the client value into a sane range.
 
 # Bound on how much of a command's output we retain. A remote command can emit
 # arbitrarily large output (``yes``, ``cat /dev/zero``, a huge log dump);

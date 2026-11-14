@@ -20,8 +20,10 @@ Default integration for Hermes (a Python agent):
         agent.stop_process(pid)
 
 The client is a thin JSON-RPC layer over a TLS WebSocket. It authenticates
-lazily on first use and transparently re-authenticates if the connection is
-dropped.
+lazily on first use and transparently reconnects if the connection is
+dropped: read-only calls are re-sent automatically; a state-changing call
+that dies in flight raises (its outcome is unknown) rather than risking a
+duplicated click/keypress/command.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from hermes_mac_agent.protocol import (
     FILE_CHUNK_SIZE,
     INTERNAL_ERROR,
     INVALID_PARAMS,
+    MAX_COMMAND_TIMEOUT,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     PROCESS_NOT_FOUND,
@@ -131,6 +134,9 @@ class MacAgent:
         self._ws: Any = None
         self._authed = False
         self._next_id = 0
+        #: True once the current request's frame has been handed to the
+        #: socket; distinguishes "daemon may have acted" from "not sent".
+        self._request_sent = False
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -229,29 +235,106 @@ class MacAgent:
     # JSON-RPC plumbing
     # ------------------------------------------------------------------
 
-    async def _roundtrip(self, ws: Any, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # JSON-RPC plumbing
+    # ------------------------------------------------------------------
+
+    #: Read-only methods: safe to resend if the connection drops mid-call,
+    #: because repeating them cannot change the Mac's state. Every other
+    #: method is state-mutating and must never be silently re-sent.
+    _READ_ONLY_METHODS = frozenset(
+        {"screenshot", "health", "list_processes", "read_file"}
+    )
+
+    def _read_timeout(self, method: str, params: dict[str, Any]) -> float:
+        """Wall-clock budget for one request/response roundtrip.
+
+        ``run_command`` carries its own timeout and the daemon will keep
+        running the command for that long (clamped to MAX_COMMAND_TIMEOUT).
+        A fixed read deadline shorter than that makes the client give up
+        while the command is still executing — the agent sees a false
+        failure for work that may succeed, and the daemon's late response
+        lingers on the socket. Cover the command's full budget on top of
+        the transport timeout so the response is always awaited.
+        """
+        try:
+            extra = float(params.get("timeout") or 0.0)
+        except (TypeError, ValueError):
+            extra = 0.0
+        extra = max(0.0, min(extra, MAX_COMMAND_TIMEOUT))
+        return self.timeout + extra
+
+    async def _roundtrip(
+        self,
+        ws: Any,
+        method: str,
+        params: dict[str, Any],
+        read_timeout: float | None = None,
+    ) -> dict[str, Any]:
         self._next_id += 1
-        req = {"id": self._next_id, "method": method, "params": params}
+        req_id = self._next_id
+        req = {"id": req_id, "method": method, "params": params}
         await ws.send(json.dumps(req))
-        raw = await asyncio.wait_for(ws.recv(), timeout=self.timeout)
-        return json.loads(raw)
+        self._request_sent = True
+        # Match the response by JSON-RPC id. Without this, any response that
+        # arrives after the client gave up on an earlier call (e.g. a long
+        # run_command that outlived the read timeout) is silently returned as
+        # the answer to the *next* request — every subsequent call in the
+        # session reads the previous call's result. Discard stale responses
+        # instead; the daemon pairs one response with one request, so the
+        # matching response always follows the stragglers.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (
+            self._read_timeout(method, params)
+            if read_timeout is None
+            else read_timeout
+        )
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            resp = json.loads(raw)
+            if resp.get("id") == req_id:
+                return resp
+            log.warning(
+                "discarding stale response id=%r (expected %r) for %s",
+                resp.get("id"),
+                req_id,
+                method,
+            )
 
     async def _call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         for attempt in (1, 2):
+            self._request_sent = False
             ws = self._ws
             if ws is None or self._authed is False:
                 await self._connect_and_auth()
                 ws = self._ws
+            self._request_sent = False
+            read_timeout = self._read_timeout(method, params)
             try:
-                resp = await self._roundtrip(ws, method, params)
+                resp = await self._roundtrip(ws, method, params, read_timeout)
             except asyncio.TimeoutError as exc:
                 # A slow/missing response must surface as a MacAgentError, not a
                 # raw asyncio.TimeoutError, so callers catching the documented
                 # exception type are not blindsided.
                 raise MacAgentError(
-                    INTERNAL_ERROR, f"request timed out after {self.timeout}s"
+                    INTERNAL_ERROR, f"request timed out after {read_timeout}s"
                 ) from exc
-            except (ConnectionClosed, OSError):
+            except (ConnectionClosed, OSError) as exc:
+                if self._request_sent and method not in self._READ_ONLY_METHODS:
+                    # The request reached the daemon but the connection died
+                    # before its response: the action may already have been
+                    # performed. Re-sending would duplicate a click/keypress/
+                    # command, which is worse than an explicit error — the
+                    # documented agent loop verifies effects via screenshot.
+                    raise MacAgentError(
+                        INTERNAL_ERROR,
+                        f"connection lost after sending {method!r}; outcome "
+                        "unknown — verify the Mac's state (screenshot/health) "
+                        "before retrying",
+                    ) from exc
                 if attempt == 2:
                     raise
                 self._authed = False

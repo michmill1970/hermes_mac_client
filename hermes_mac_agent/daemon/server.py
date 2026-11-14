@@ -50,7 +50,7 @@ from hermes_mac_agent.protocol import (
 
 log = logging.getLogger("hermes_mac_agent.daemon")
 
-# Per-request wall-clock cap. This MUST exceed tools.MAX_COMMAND_TIMEOUT
+# Per-request wall-clock cap. This MUST exceed protocol.MAX_COMMAND_TIMEOUT
 # (300s): run_command owns its own deadline and kills its process group when
 # *it* expires. If this server-side cap fired first, asyncio.wait_for would
 # cancel the to_thread future without stopping the worker thread, orphaning

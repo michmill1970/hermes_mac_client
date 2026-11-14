@@ -80,6 +80,11 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 #: (~13.4 MiB) plus JSON envelope overhead.
 WS_MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
+#: Upper bound for a run_command "timeout" param. The daemon clamps the
+#: command wall-clock time to this; the client uses it to size its read
+#: deadline so a long command's response is never mistaken for a timeout.
+MAX_COMMAND_TIMEOUT = 300.0
+
 
 # ---------------------------------------------------------------------------
 # Message types
