@@ -15,6 +15,7 @@ Connection lifecycle:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -67,13 +68,61 @@ class Connection:
         self.authenticated = False
 
 
+# Audit-log parameter redaction. An audit line must answer "who did what"
+# without also becoming a copy of *what they sent*:
+#   * write_file "data" — base64 chunks of up to 256 KiB (~341 KB of text per
+#     log line) flooded audit.log and duplicated transferred file content.
+#   * type_text  "text" — typed text routinely contains passwords and other
+#     secrets; it has no business in an operator-readable log.
+# Redacted fields keep a length + short sha256 so identical payloads can still
+# be correlated across lines (e.g. the chunks of one streamed file).
+_REDACTED_PARAMS: dict[str, tuple[str, ...]] = {
+    "write_file": ("data",),
+    "type_text": ("text",),
+}
+
+# Safety net for every other method/field: one audit line must stay bounded no
+# matter what a client sends (a single frame can be 16 MiB). Over-long strings
+# keep a short prefix — enough context to see what ran, not a copy of it.
+_MAX_AUDIT_STR = 2000
+_MAX_AUDIT_PREVIEW = 80
+
+
+def _summarize(value: Any, preview: bool) -> dict[str, Any]:
+    if not isinstance(value, str):
+        return {"omitted": True}
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+    summary: dict[str, Any] = {"omitted": True, "length": len(value), "sha256_12": digest[:12]}
+    if preview:
+        summary["prefix"] = value[:_MAX_AUDIT_PREVIEW]
+    return summary
+
+
+def _redact_params(method: str, params: Any) -> Any:
+    """Return *params* safe to write to the audit log (never raises)."""
+    if not isinstance(params, dict):  # protocol guarantees dict; never trust it here
+        return _summarize(params, preview=True)
+    redact = _REDACTED_PARAMS.get(method, ())
+    out: dict[str, Any] = {}
+    for key, value in params.items():
+        if key in redact:
+            out[key] = _summarize(value, preview=False)
+        elif isinstance(value, str) and len(value) > _MAX_AUDIT_STR:
+            out[key] = _summarize(value, preview=True)
+        else:
+            out[key] = value
+    return out
+
+
 def _audit(event: str, remote: str, method: str, params: Any, outcome: str) -> None:
     """Append one line to the audit log (best-effort; never raises).
 
     Records every authenticated tool call and every auth attempt so an operator
     can see what a connected client actually did. Written to
-    ``CONFIG_DIR/audit.log`` (mode 0600). Failures are swallowed — auditing
-    must never take the daemon down.
+    ``CONFIG_DIR/audit.log`` (mode 0600). Bulk/sensitive params (``write_file``
+    data, ``type_text`` text) are replaced with length+sha256 summaries, and any
+    other over-long string is truncated — see :func:`_redact_params`. Failures
+    are swallowed — auditing must never take the daemon down.
     """
     try:
         entry = {
@@ -81,7 +130,7 @@ def _audit(event: str, remote: str, method: str, params: Any, outcome: str) -> N
             "event": event,
             "remote": remote,
             "method": method,
-            "params": params,
+            "params": _redact_params(method, params),
             "outcome": outcome,
         }
         path = CONFIG_DIR / "audit.log"

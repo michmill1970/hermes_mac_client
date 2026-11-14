@@ -362,7 +362,10 @@ commands, process kill). Treat it accordingly.
   reachable.
 - **Every call is audit-logged.** Each authenticated tool call and every auth attempt
   (success or failure) is appended to `~/.hermes_mac_agent/audit.log` (mode 600) with
-  a UTC timestamp, source address, method, params, and outcome.
+  a UTC timestamp, source address, method, params, and outcome. Bulk and sensitive
+  params — `write_file` data chunks and `type_text` text — are logged only as a
+  length + sha256 summary (never the content itself); other over-long values are
+  truncated to an 80-char prefix plus the same summary.
 - **The MCP `run_command` tool is opt-in.** It is disabled unless
   `HERMES_MAC_ALLOW_RUN_COMMAND=1` is set, because an LLM-facing shell tool is a
   prompt-injection → RCE path.

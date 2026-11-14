@@ -245,9 +245,12 @@ shipping logs off-host.
 **Fixed:** `daemon/server.py` now appends a JSON line to
 `~/.hermes_mac_agent/audit.log` (mode 600) for **every** authenticated tool call
 and **every** auth attempt (success or failure), recording a UTC timestamp,
-source address, method, params, and outcome. The write is best-effort and never
-takes the daemon down. (Off-host shipping / signing is still a future hardening
-step.)
+source address, method, params, and outcome. Bulk/sensitive params
+(`write_file` base64 chunks, `type_text` text) are recorded only as a
+length + sha256 summary, and any other over-long string is truncated to a
+short prefix — so the log cannot be flooded or leak typed secrets. The write
+is best-effort and never takes the daemon down. (Off-host shipping / signing
+is still a future hardening step.)
 
 ---
 

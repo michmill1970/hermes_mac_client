@@ -624,6 +624,56 @@ class TestAuditLog:
         assert second["event"] == "auth"
         assert second["outcome"] == "failed"
 
+    def test_audit_redacts_bulk_and_sensitive_params(self, tmp_path, monkeypatch):
+        import hermes_mac_agent.daemon.server as server
+        import json
+
+        monkeypatch.setattr("hermes_mac_agent.daemon.server.CONFIG_DIR", tmp_path)
+        payload = "A" * 300_000  # a full 256 KiB chunk encoded as base64
+        server._audit("call", "r", "write_file",
+                      {"path": "/tmp/x.bin", "offset": 0, "data": payload}, "ok")
+        server._audit("call", "r", "write_file",
+                      {"path": "/tmp/x.bin", "offset": 262144, "data": payload}, "ok")
+        # sensitive regardless of length: passwords are short
+        server._audit("call", "r", "type_text", {"text": "hunter2"}, "ok")
+
+        lines = (tmp_path / "audit.log").read_text().strip().splitlines()
+        wf1, wf2, tt = (json.loads(line) for line in lines)
+
+        # non-payload params survive untouched — the audit trail stays useful
+        assert wf1["params"]["path"] == "/tmp/x.bin"
+        assert wf1["params"]["offset"] == 0
+        # the payload itself is gone, replaced by a correlation summary
+        redacted = wf1["params"]["data"]
+        assert redacted["omitted"] is True
+        assert redacted["length"] == 300_000
+        assert "prefix" not in redacted  # bulk/sensitive fields are never previewed
+        assert payload[:100] not in lines[0]
+        # identical chunks hash identically, so writes of one file stay correlatable
+        assert redacted["sha256_12"] == wf2["params"]["data"]["sha256_12"]
+        # short-but-sensitive text is redacted too
+        assert tt["params"]["text"]["omitted"] is True
+        assert tt["params"]["text"]["length"] == 7
+        assert "hunter2" not in lines[2]
+
+    def test_audit_long_param_safety_net(self, tmp_path, monkeypatch):
+        import hermes_mac_agent.daemon.server as server
+        import json
+
+        monkeypatch.setattr("hermes_mac_agent.daemon.server.CONFIG_DIR", tmp_path)
+        # a legitimately long command still yields a bounded line, but keeps
+        # enough prefix to see what ran
+        long_cmd = "echo " + "x" * 5000 + " && true"
+        server._audit("call", "r", "run_command", {"cmd": long_cmd}, "ok")
+
+        entry = json.loads((tmp_path / "audit.log").read_text().strip())
+        cmd = entry["params"]["cmd"]
+        assert cmd["omitted"] is True
+        assert cmd["length"] == len(long_cmd)
+        assert cmd["prefix"] == long_cmd[:80]
+        assert long_cmd not in json.dumps(entry)
+        # short commands are logged verbatim (covered by test_audit_writes_jsonl)
+
     def test_audit_never_raises(self, tmp_path, monkeypatch):
         import hermes_mac_agent.daemon.server as server
 
