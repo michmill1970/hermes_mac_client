@@ -41,6 +41,33 @@ from hermes_mac_agent.protocol import (
 IS_MAC = sys.platform == "darwin"
 
 
+def _quiet_sleeps(monkeypatch, record=None):
+    """Skip real pacing sleeps during a test; optionally record durations.
+
+    (Pacing code uses time.sleep; tests either wait for nothing or assert on
+    the recorded duration sequence.)
+    """
+    from hermes_mac_agent.daemon import tools
+
+    def _sleep(s):
+        if record is not None:
+            record.append(s)
+
+    monkeypatch.setattr(tools.time, "sleep", _sleep)
+
+
+def _position_from_moves(calls):
+    """pyautogui.position() stub: the cursor 'is' where the last moveTo put it."""
+
+    def _pos():
+        for name, args, kwargs in reversed(calls):
+            if name == "moveTo":
+                return args
+        return (0, 0)
+
+    return _pos
+
+
 @pytest.fixture
 def config() -> Config:
     # allowlist=["*"] so command/app tests can run; the policy tests below
@@ -282,11 +309,14 @@ class TestGuiBehavior:
                 calls.append((name, args, kwargs))
             return _fn
 
-        for name in ("moveTo", "dragTo", "drag", "press", "hotkey"):
+        for name in ("moveTo", "dragTo", "drag", "press", "hotkey", "mouseDown",
+                     "mouseUp", "keyDown", "keyUp"):
             setattr(stub, name, _record(name))
+        stub.position = _position_from_moves(calls)
 
         monkeypatch.setitem(sys.modules, "pyautogui", stub)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        _quiet_sleeps(monkeypatch)
         return calls
 
     def test_mouse_drag_is_absolute(self, monkeypatch):
@@ -310,22 +340,30 @@ class TestGuiBehavior:
         assert drag[1] == (60, 60)
         assert drag[2].get("duration") == 0.2
 
-    def test_key_press_single_key_uses_press(self, monkeypatch):
-        # M4: a single key is a press, not a hotkey.
+    def test_key_press_single_key_is_paced_press(self, monkeypatch):
+        # M4: a single key is a press, not a hotkey. Pacing fix: press =
+        # paced keyDown/keyUp (pa.press posts them with zero gap, the
+        # machine-speed burst that drops events under load).
         calls = self._stub_pyautogui(monkeypatch)
         from hermes_mac_agent.daemon.tools import tool_key_press
 
         tool_key_press({"keys": ["return"]})
-        assert [c[0] for c in calls] == ["press"]
+        assert [c[0] for c in calls] == ["keyDown", "keyUp"]
         assert calls[0][1] == ("return",)
+        assert "press" not in [c[0] for c in calls]
+        assert "hotkey" not in [c[0] for c in calls]
 
-    def test_key_press_combo_uses_hotkey(self, monkeypatch):
+    def test_key_press_combo_is_paced_chord(self, monkeypatch):
         calls = self._stub_pyautogui(monkeypatch)
         from hermes_mac_agent.daemon.tools import tool_key_press
 
         tool_key_press({"keys": ["command", "c"]})
-        assert [c[0] for c in calls] == ["hotkey"]
-        assert calls[0][1] == ("command", "c")
+        seq = [(c[0], c[1][0]) for c in calls]
+        assert seq == [
+            ("keyDown", "command"), ("keyDown", "c"),
+            ("keyUp", "c"), ("keyUp", "command"),
+        ]
+        assert "hotkey" not in [c[0] for c in calls]
 
 
 # ---------------------------------------------------------------------------
@@ -367,10 +405,12 @@ class TestPercentageCoordinates:
                 calls.append((name, args, kwargs))
             return _fn
 
-        for name in ("moveTo", "dragTo", "click"):
+        for name in ("moveTo", "dragTo", "click", "mouseDown", "mouseUp"):
             setattr(pa, name, _record(name))
+        pa.position = _position_from_moves(calls)
         monkeypatch.setitem(sys.modules, "pyautogui", pa)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        _quiet_sleeps(monkeypatch)
         return calls
 
     # Single 1000x800 primary; click space == screenshot space (scale 1.0).
@@ -408,9 +448,9 @@ class TestPercentageCoordinates:
         from hermes_mac_agent.daemon.tools import tool_mouse_click
 
         tool_mouse_click({"x": 0.5, "y": 0.5, "monitor": 2})
-        click = next(c for c in calls if c[0] == "click")
+        move = next(c for c in calls if c[0] == "moveTo")
         # scale = 1000/1000 = 1.0 ; -1200 + 0.5*1200 = -600 ; 0 + 0.5*900 = 450
-        assert click[1] == (-600, 450)
+        assert move[1] == (-600, 450)
 
     def test_multi_display_scale_uses_primary_not_virtual(self, monkeypatch):
         # Regression for the multi-display miss: with several displays the
@@ -429,9 +469,9 @@ class TestPercentageCoordinates:
 
         # Center of monitor 2.
         tool_mouse_click({"x": 0.5, "y": 0.5, "monitor": 2})
-        click = next(c for c in calls if c[0] == "click")
+        move = next(c for c in calls if c[0] == "moveTo")
         # scale = 1728/1728 = 1.0 ; -5120 + 0.5*2560 = -3840 ; 0 + 0.5*1440 = 720
-        assert click[1] == (-3840, 720)
+        assert move[1] == (-3840, 720)
 
     def test_percentage_retina_scale(self, monkeypatch):
         # Unscaled Retina: mss reports 2x pixels, pyautogui clicks in points.
@@ -835,19 +875,20 @@ class TestKeyPressValidation:
             return _fn
 
         stub = types.SimpleNamespace()
-        for name in ("press", "hotkey"):
+        for name in ("keyDown", "keyUp"):
             setattr(stub, name, _record(name))
         if key_names is not None:
             stub.KEY_NAMES = set(key_names)
         if press_raises is not None:
             def _boom(*a, **k):
                 raise press_raises
-            stub.press = _boom
+            stub.keyDown = _boom
         stub.FindKeyError = getattr(press_raises, "__class__", Exception) \
             if press_raises is not None else Exception
 
         monkeypatch.setitem(sys.modules, "pyautogui", stub)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        _quiet_sleeps(monkeypatch)
         return calls
 
     def test_alias_cmd_becomes_command(self, monkeypatch):
@@ -855,14 +896,18 @@ class TestKeyPressValidation:
         from hermes_mac_agent.daemon.tools import tool_key_press
 
         tool_key_press({"keys": ["cmd", "c"]})
-        assert calls[0][0] == "hotkey"
-        assert calls[0][1] == ("command", "c")
+        seq = [(name, args[0]) for name, args, _ in calls]
+        assert seq == [
+            ("keyDown", "command"), ("keyDown", "c"),
+            ("keyUp", "c"), ("keyUp", "command"),
+        ]
 
     def test_alias_control_becomes_ctrl_case_insensitive(self, monkeypatch):
         calls = self._stub(monkeypatch)
         from hermes_mac_agent.daemon.tools import tool_key_press
 
         tool_key_press({"keys": ["Control"]})
+        assert calls[0][0] == "keyDown"
         assert calls[0][1] == ("ctrl",)
 
     def test_combo_in_one_string_rejected(self, monkeypatch):
@@ -923,10 +968,13 @@ class TestParamCoercion:
             return _fn
 
         stub = types.SimpleNamespace()
-        for name in ("scroll", "hscroll", "click", "write", "moveTo"):
+        for name in ("scroll", "hscroll", "click", "write", "moveTo",
+                     "mouseDown", "mouseUp"):
             setattr(stub, name, _record(name))
+        stub.position = _position_from_moves(calls)
         monkeypatch.setitem(sys.modules, "pyautogui", stub)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        _quiet_sleeps(monkeypatch)
         return calls
 
     def test_scroll_numeric_string_accepted(self, monkeypatch):
@@ -949,8 +997,10 @@ class TestParamCoercion:
         from hermes_mac_agent.daemon.tools import tool_mouse_click
 
         tool_mouse_click({"clicks": "2"})
-        click = next(c for c in calls if c[0] == "click")
-        assert click[2]["clicks"] == 2
+        downs = [c for c in calls if c[0] == "mouseDown"]
+        ups = [c for c in calls if c[0] == "mouseUp"]
+        assert len(downs) == 2 and len(ups) == 2
+        assert downs[0][2] == ups[0][2] == {"button": "left"}
 
     def test_clicks_garbage_is_invalid_params(self, monkeypatch):
         self._pa(monkeypatch)
@@ -986,3 +1036,159 @@ class TestParamCoercion:
         tools._pyautogui()
         assert stub.FAILSAFE is False
         assert stub.PAUSE == 0
+
+
+class TestInputPacing:
+    """Human-scale event pacing (the machine-speed-defect fix).
+
+    Bursts of machine-speed CGEvents get partially dropped on a loaded
+    macOS: partial key-up loss sticks modifiers (later keys become system
+    hotkeys) and button events overtake cursor warps (clicks land at the
+    OLD cursor position). The tools must therefore verify cursor arrival
+    before pressing, hold buttons, floor type intervals, and release every
+    modifier they pressed — all asserted here deterministically.
+    """
+
+    def _stub(self, monkeypatch, *, position=None, raises_on=None):
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        calls, sleeps = [], []
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                if raises_on and (name, args[0] if args else None) == raises_on:
+                    raise RuntimeError(f"boom on {name} {args}")
+                calls.append((name, args, kwargs))
+            return _fn
+
+        stub = types.SimpleNamespace()
+        for name in ("moveTo", "dragTo", "mouseDown", "mouseUp", "keyDown", "keyUp",
+                     "write", "scroll", "hscroll", "press", "hotkey"):
+            setattr(stub, name, _record(name))
+        stub.position = position or (lambda: (0, 0))
+
+        monkeypatch.setitem(sys.modules, "pyautogui", stub)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        monkeypatch.setattr(tools.time, "sleep", sleeps.append)
+        return calls, sleeps
+
+    # --- click -------------------------------------------------------------
+
+    def test_click_warp_verified_before_button(self, monkeypatch):
+        calls, sleeps = self._stub(monkeypatch, position=lambda: (983, 396))
+        from hermes_mac_agent.daemon import tools
+
+        result = tools.tool_mouse_click({"x": 983, "y": 396})
+        names = [c[0] for c in calls]
+        assert names == ["moveTo", "mouseDown", "mouseUp"]
+        # settle BEFORE the press, hold while down, tail after release
+        assert sleeps == [tools.CLICK_SETTLE, tools.CLICK_PRESS, tools.ACTION_TAIL]
+        assert result == {"ok": True, "cursor": [983, 396]}
+
+    def test_click_refuses_to_press_when_cursor_stuck(self, monkeypatch):
+        calls, _ = self._stub(monkeypatch, position=lambda: (10, 10))
+        from hermes_mac_agent.daemon import tools
+        from hermes_mac_agent.protocol import INTERNAL_ERROR
+
+        monkeypatch.setattr(tools, "CLICK_VERIFY_TIMEOUT", 0.05)
+        monkeypatch.setattr(tools, "CLICK_VERIFY_POLL", 0.01)
+        with pytest.raises(tools.ToolError) as exc:
+            tools.tool_mouse_click({"x": 500, "y": 500})
+        assert exc.value.code == INTERNAL_ERROR
+        assert "cursor did not reach" in str(exc.value)
+        # THE point of the check: no button events at the wrong position.
+        assert [c[0] for c in calls] == ["moveTo"]
+
+    def test_multiclick_has_gapped_presses(self, monkeypatch):
+        calls, sleeps = self._stub(monkeypatch, position=lambda: (5, 5))
+        from hermes_mac_agent.daemon import tools
+
+        tools.tool_mouse_click({"x": 5, "y": 5, "clicks": 2})
+        names = [c[0] for c in calls]
+        assert names == ["moveTo", "mouseDown", "mouseUp", "mouseDown", "mouseUp"]
+        # settle, press, gap, press, tail — gap keeps the double-click inside
+        # the OS double-click window without tripping click-debounce.
+        assert sleeps == [
+            tools.CLICK_SETTLE, tools.CLICK_PRESS, tools.CLICK_MULTI_GAP,
+            tools.CLICK_PRESS, tools.ACTION_TAIL,
+        ]
+
+    def test_drag_verifies_start_warp_before_grab(self, monkeypatch):
+        calls, sleeps = self._stub(monkeypatch, position=lambda: (10, 10))
+        from hermes_mac_agent.daemon import tools
+
+        tools.tool_mouse_drag({"x1": 10, "y1": 10, "x2": 90, "y2": 90})
+        names = [c[0] for c in calls]
+        assert names == ["moveTo", "dragTo"]
+        assert sleeps[0] == tools.CLICK_SETTLE  # verified before dragTo's mouseDown
+
+    # --- typing ------------------------------------------------------------
+
+    def test_type_interval_floored(self, monkeypatch):
+        calls, _ = self._stub(monkeypatch)
+        from hermes_mac_agent.daemon import tools
+
+        tools.tool_type_text({"text": "hi", "interval": 0})
+        write = next(c for c in calls if c[0] == "write")
+        assert write[2]["interval"] == tools.TYPE_INTERVAL_FLOOR
+
+    def test_type_interval_above_floor_passes_through(self, monkeypatch):
+        calls, _ = self._stub(monkeypatch)
+        from hermes_mac_agent.daemon import tools
+
+        tools.tool_type_text({"text": "hi", "interval": 0.5})
+        write = next(c for c in calls if c[0] == "write")
+        assert write[2]["interval"] == 0.5
+
+    # --- keyboard ----------------------------------------------------------
+
+    def test_single_key_paced_press(self, monkeypatch):
+        calls, sleeps = self._stub(monkeypatch)
+        from hermes_mac_agent.daemon import tools
+
+        tools.tool_key_press({"keys": ["a"]})
+        assert [c[0] for c in calls] == ["keyDown", "keyUp"]
+        assert sleeps == [tools.KEY_SETTLE, tools.ACTION_TAIL]
+
+    def test_chord_releases_in_reverse_order(self, monkeypatch):
+        calls, _ = self._stub(monkeypatch)
+        from hermes_mac_agent.daemon import tools
+
+        tools.tool_key_press({"keys": ["command", "shift", "3"]})
+        seq = [(n, a[0]) for n, a, _ in calls]
+        assert seq == [
+            ("keyDown", "command"), ("keyDown", "shift"),
+            ("keyDown", "3"), ("keyUp", "3"),
+            ("keyUp", "shift"), ("keyUp", "command"),
+        ]
+
+    def test_chord_releases_modifiers_even_if_key_fails(self, monkeypatch):
+        # A leaked modifier key-up poisons every later keystroke (stuck-mod
+        # system hotkeys), so releases run in finally, not on the happy path.
+        calls, _ = self._stub(monkeypatch, raises_on=("keyDown", "v"))
+        from hermes_mac_agent.daemon.tools import tool_key_press
+
+        with pytest.raises(RuntimeError):
+            tool_key_press({"keys": ["command", "v"]})
+        seq = [(n, a[0]) for n, a, _ in calls]
+        assert ("keyUp", "command") in seq  # command released despite failure
+
+    # --- percentage precision (user-mandated ≥5 decimals) -------------------
+
+    def test_five_decimal_percentage_round_trips_to_exact_pixel(self, monkeypatch):
+        # The documented agent pattern: measure (983,396) in a 1792x1120
+        # screenshot, send round(px/w, 5); the daemon must integer-round
+        # back to the exact pixel (0.00001 * 1792px = 0.02px error budget).
+        calls = TestPercentageCoordinates()._stub(
+            monkeypatch,
+            [{"left": 0, "top": 0, "width": 1792, "height": 1120},
+             {"left": 0, "top": 0, "width": 1792, "height": 1120}],
+            1792, 1120,
+        )
+        from hermes_mac_agent.daemon.tools import tool_mouse_click
+
+        tool_mouse_click({"x": round(983 / 1792, 5), "y": round(396 / 1120, 5)})
+        move = next(c for c in calls if c[0] == "moveTo")
+        assert move[1] == (983, 396)

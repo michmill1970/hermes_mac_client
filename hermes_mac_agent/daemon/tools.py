@@ -241,6 +241,91 @@ def tool_screenshot(params: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Input pacing (human-scale event timing)
+# ---------------------------------------------------------------------------
+#
+# macOS queues synthetic input exactly like real HID input. Events posted in a
+# machine-speed burst — a cursor warp and the button event in the same
+# microsecond, or 44 keystrokes at 20 ms apart on a busy machine — outrun the
+# WindowServer session queue and the target app's run loop, and parts of the
+# stream get dropped. The failures are stateful and ugly: a dropped key-UP
+# leaves the modifier stuck (the next ordinary keystrokes become system
+# hotkeys — double Control opens the Dictation dialog, Ctrl+Cmd+Space the
+# Character Viewer), and a button event processed before the warp lands
+# clicks wherever the cursor *was*. Measured on a loaded test laptop: 2 of 22
+# keystrokes delivered at interval=0, and clicks landing ~100 px off.
+#
+# These floors put a human scale on the event pipeline. They are minimums
+# (smaller explicit values are raised to them), not padding: each sleep is
+# the smallest gap that measured clean delivery across the click/scroll/type
+# batteries, and callers still verify every action's effect with a screenshot.
+CLICK_SETTLE = 0.05     # cursor arrival verified -> mouseDown
+CLICK_PRESS = 0.04      # mouseDown -> mouseUp (button hold)
+CLICK_MULTI_GAP = 0.12  # mouseUp -> next mouseDown (above click-debounce,
+                        # well inside the double-click window)
+CLICK_VERIFY_TIMEOUT = 1.0   # bound for cursor-arrival verification
+CLICK_VERIFY_POLL = 0.01
+KEY_SETTLE = 0.02       # keyDown -> keyUp (and chord key gaps)
+TYPE_INTERVAL_FLOOR = 0.02   # minimum per-character interval for type_text
+ACTION_TAIL = 0.03      # after the last event of a call, so the next call's
+                        # events start on a quiet pipeline
+
+
+def _verify_cursor(pa, px: int, py: int) -> None:
+    """Verify the warp actually landed before pressing a button.
+
+    Polls pyautogui's own cursor read (not a blind sleep): under load the
+    warp can still be in flight when the click is posted, and a button event
+    lands at the cursor's *previous* position. Raises INTERNAL_ERROR after
+    the timeout — a degraded pipeline is a retryable condition, not a lie of
+    "ok" for a click that did not go where asked.
+    """
+    deadline = time.monotonic() + CLICK_VERIFY_TIMEOUT
+    while True:
+        pos = pa.position()
+        if abs(int(pos[0]) - px) <= 1 and abs(int(pos[1]) - py) <= 1:
+            time.sleep(CLICK_SETTLE)
+            return
+        if time.monotonic() >= deadline:
+            raise ToolError(
+                INTERNAL_ERROR,
+                f"cursor did not reach ({px},{py}) within "
+                f"{CLICK_VERIFY_TIMEOUT:.1f}s (stuck at "
+                f"{(int(pos[0]), int(pos[1]))}); input pipeline degraded — "
+                "retry the click",
+            )
+        time.sleep(CLICK_VERIFY_POLL)
+
+
+def _press_paced(pa, key: str) -> None:
+    """One key down/up with the settle gap; keyUp is finally-safe."""
+    pa.keyDown(key)
+    try:
+        time.sleep(KEY_SETTLE)
+    finally:
+        pa.keyUp(key)
+
+
+def _hotkey_paced(pa, keys: list[str]) -> None:
+    """Chord: modifiers down (in order), key, up in reverse.
+
+    Every pressed modifier is released even if the final key's events raise —
+    a leaked modifier keyUp poisons ALL later input (stuck-modifier
+    hotkeys), so release runs in finally, never on the happy path only.
+    """
+    held: list[str] = []
+    try:
+        for mod in keys[:-1]:
+            pa.keyDown(mod)
+            held.append(mod)
+            time.sleep(KEY_SETTLE)
+        _press_paced(pa, keys[-1])
+    finally:
+        for mod in reversed(held):
+            pa.keyUp(mod)
+
+
+# ---------------------------------------------------------------------------
 # Mouse
 # ---------------------------------------------------------------------------
 
@@ -335,8 +420,12 @@ def tool_mouse_move(params: dict[str, Any]) -> dict[str, Any]:
     duration = _num_float(params, "duration", 0.0)
     px, py = _resolve_point(params, "x", "y")  # validates + converts before TCC
     _require_accessibility()
-    _pyautogui().moveTo(px, py, duration=duration)
-    return {"ok": True}
+    pa = _pyautogui()
+    pa.moveTo(px, py, duration=duration)
+    _verify_cursor(pa, px, py)
+    time.sleep(ACTION_TAIL)
+    pos = pa.position()
+    return {"ok": True, "cursor": [int(pos[0]), int(pos[1])]}
 
 
 def tool_mouse_click(params: dict[str, Any]) -> dict[str, Any]:
@@ -353,10 +442,22 @@ def tool_mouse_click(params: dict[str, Any]) -> dict[str, Any]:
     _require_accessibility()
     pa = _pyautogui()
     if x is not None:
-        pa.click(px, py, button=button, clicks=clicks)
-    else:
-        pa.click(button=button, clicks=clicks)
-    return {"ok": True}
+        # Warp first, verify the cursor is actually there, only then press.
+        # (pa.click warps and presses back-to-back with zero gap — under
+        # load the press overtakes the warp and lands at the old position.)
+        pa.moveTo(px, py)
+        _verify_cursor(pa, px, py)
+    # Manual down/up so the button has a real hold time (pa.click posts
+    # down+up back-to-back; some apps' hit-testing drops zero-width presses).
+    for i in range(clicks):
+        pa.mouseDown(button=button)
+        time.sleep(CLICK_PRESS)
+        pa.mouseUp(button=button)
+        if i + 1 < clicks:
+            time.sleep(CLICK_MULTI_GAP)
+    time.sleep(ACTION_TAIL)
+    pos = pa.position()
+    return {"ok": True, "cursor": [int(pos[0]), int(pos[1])]}
 
 
 def tool_mouse_drag(params: dict[str, Any]) -> dict[str, Any]:
@@ -370,7 +471,9 @@ def tool_mouse_drag(params: dict[str, Any]) -> dict[str, Any]:
     # would not honor (x1, y1) as the origin.
     pa = _pyautogui()
     pa.moveTo(x1, y1, duration=0.0)
+    _verify_cursor(pa, x1, y1)  # the drag's mouseDown must not outrun the warp
     pa.dragTo(x2, y2, button=button, duration=duration)
+    time.sleep(ACTION_TAIL)
     return {"ok": True}
 
 
@@ -383,6 +486,9 @@ def tool_mouse_scroll(params: dict[str, Any]) -> dict[str, Any]:
         pa.scroll(dy)
     if dx:
         pa.hscroll(dx)
+    # Tail gap keeps rapid scroll calls (and a move->scroll pair targeting a
+    # pane) from coalescing or landing before the prior move is settled.
+    time.sleep(ACTION_TAIL)
     return {"ok": True}
 
 
@@ -395,8 +501,14 @@ def tool_type_text(params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(text, str):
         raise ToolError(INVALID_PARAMS, "'text' must be a string")
     interval = _num_float(params, "interval", 0.0)
+    # Floor the interval: interval=0 posts one event per microsecond and the
+    # pipeline drops part of the stream on a loaded machine (measured: 2 of
+    # 22 keystrokes delivered). Callers may ask for MORE spacing, never less.
+    if interval < TYPE_INTERVAL_FLOOR:
+        interval = TYPE_INTERVAL_FLOOR
     _require_accessibility()
     _pyautogui().write(text, interval=interval)
+    time.sleep(ACTION_TAIL)
     return {"ok": True}
 
 
@@ -465,18 +577,20 @@ def tool_key_press(params: dict[str, Any]) -> dict[str, Any]:
     valid = _key_valid_names(pa)
     if valid is not None:
         keys = [_validate_key(k, valid) for k in keys]
-    # A single key is a press; a combination is a simultaneous hotkey.
-    # FindKeyError (key accepted by us but unknown to pyautogui — only
-    # reachable when KEY_NAMES introspection fails) is a parameter fault,
-    # not a daemon fault: report INVALID_PARAMS with a clear message.
+    # A single key is a paced press; a combination is a chord whose releases
+    # are finally-safe (see _hotkey_paced). FindKeyError (key accepted by us
+    # but unknown to pyautogui — only reachable when KEY_NAMES introspection
+    # fails) is a parameter fault, not a daemon fault: report INVALID_PARAMS
+    # with a clear message.
     find_key_error = getattr(pa, "FindKeyError", ())
     try:
         if len(keys) == 1:
-            pa.press(keys[0])
+            _press_paced(pa, keys[0])
         else:
-            pa.hotkey(*keys)
+            _hotkey_paced(pa, keys)
     except find_key_error as exc:
         raise ToolError(INVALID_PARAMS, f"key not supported: {exc}") from exc
+    time.sleep(ACTION_TAIL)
     return {"ok": True}
 
 
