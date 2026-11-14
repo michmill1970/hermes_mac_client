@@ -807,3 +807,182 @@ class TestMcpFileTransferGate:
                 assert "HERMES_MAC_ALLOW_FILE_TRANSFER" not in str(exc)
             except Exception:
                 pass  # connection error is fine — the gate was passed
+
+
+# ---------------------------------------------------------------------------
+# key_press validation & parameter coercion
+# ---------------------------------------------------------------------------
+
+
+class TestKeyPressValidation:
+    """key_press must answer INVALID_PARAMS (with hints) for bad key input.
+
+    The failed-agent pattern: a misspelled key like 'cmd+c' or 'retunr'
+    reaches pyautogui, dies as FindKeyError → INTERNAL_ERROR, and agents
+    (correctly) treat INTERNAL_ERROR as a daemon fault and retry forever.
+    """
+
+    def _stub(self, monkeypatch, *, key_names=None, press_raises=None):
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        calls = []
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                calls.append((name, args, kwargs))
+            return _fn
+
+        stub = types.SimpleNamespace()
+        for name in ("press", "hotkey"):
+            setattr(stub, name, _record(name))
+        if key_names is not None:
+            stub.KEY_NAMES = set(key_names)
+        if press_raises is not None:
+            def _boom(*a, **k):
+                raise press_raises
+            stub.press = _boom
+        stub.FindKeyError = getattr(press_raises, "__class__", Exception) \
+            if press_raises is not None else Exception
+
+        monkeypatch.setitem(sys.modules, "pyautogui", stub)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        return calls
+
+    def test_alias_cmd_becomes_command(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+        from hermes_mac_agent.daemon.tools import tool_key_press
+
+        tool_key_press({"keys": ["cmd", "c"]})
+        assert calls[0][0] == "hotkey"
+        assert calls[0][1] == ("command", "c")
+
+    def test_alias_control_becomes_ctrl_case_insensitive(self, monkeypatch):
+        calls = self._stub(monkeypatch)
+        from hermes_mac_agent.daemon.tools import tool_key_press
+
+        tool_key_press({"keys": ["Control"]})
+        assert calls[0][1] == ("ctrl",)
+
+    def test_combo_in_one_string_rejected(self, monkeypatch):
+        from hermes_mac_agent.daemon.tools import ToolError, tool_key_press
+
+        self._stub(monkeypatch)
+        with pytest.raises(ToolError) as exc:
+            tool_key_press({"keys": ["cmd+c"]})
+        assert exc.value.code == INVALID_PARAMS
+        assert "combo" in str(exc.value)
+
+    def test_unknown_key_rejected_with_suggestion(self, monkeypatch):
+        from hermes_mac_agent.daemon.tools import ToolError, tool_key_press
+
+        self._stub(monkeypatch, key_names=["return", "command", "escape"])
+        with pytest.raises(ToolError) as exc:
+            tool_key_press({"keys": ["retunr"]})
+        assert exc.value.code == INVALID_PARAMS
+        assert "retunr" in str(exc.value)
+        assert "return" in str(exc.value)  # suggestion
+
+    def test_known_key_passes_when_table_present(self, monkeypatch):
+        calls = self._stub(monkeypatch, key_names=["return", "command"])
+        from hermes_mac_agent.daemon.tools import tool_key_press
+
+        tool_key_press({"keys": ["return"]})
+        assert calls[0][1] == ("return",)
+
+    def test_findkey_error_mapped_to_invalid_params(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+        from hermes_mac_agent.daemon.tools import ToolError
+
+        class FindKeyError(Exception):
+            pass
+
+        calls = self._stub(
+            monkeypatch, press_raises=FindKeyError("retunr")
+        )
+        with pytest.raises(ToolError) as exc:
+            tools.tool_key_press({"keys": ["retunr"]})  # no KEY_NAMES table
+        assert exc.value.code == INVALID_PARAMS
+        assert calls == []
+
+
+class TestParamCoercion:
+    """Numeric params accept JSON numbers/numeric strings; garbage → INVALID_PARAMS."""
+
+    def _pa(self, monkeypatch):
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        calls = []
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                calls.append((name, args, kwargs))
+            return _fn
+
+        stub = types.SimpleNamespace()
+        for name in ("scroll", "hscroll", "click", "write", "moveTo"):
+            setattr(stub, name, _record(name))
+        monkeypatch.setitem(sys.modules, "pyautogui", stub)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        return calls
+
+    def test_scroll_numeric_string_accepted(self, monkeypatch):
+        calls = self._pa(monkeypatch)
+        from hermes_mac_agent.daemon.tools import tool_mouse_scroll
+
+        tool_mouse_scroll({"dy": "5"})
+        assert ("scroll", (5,), {}) in calls
+
+    def test_scroll_garbage_is_invalid_params(self, monkeypatch):
+        self._pa(monkeypatch)
+        from hermes_mac_agent.daemon.tools import ToolError, tool_mouse_scroll
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_scroll({"dy": "lots"})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_clicks_numeric_string_reaches_pyautogui(self, monkeypatch):
+        calls = self._pa(monkeypatch)
+        from hermes_mac_agent.daemon.tools import tool_mouse_click
+
+        tool_mouse_click({"clicks": "2"})
+        click = next(c for c in calls if c[0] == "click")
+        assert click[2]["clicks"] == 2
+
+    def test_clicks_garbage_is_invalid_params(self, monkeypatch):
+        self._pa(monkeypatch)
+        from hermes_mac_agent.daemon.tools import ToolError, tool_mouse_click
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_click({"clicks": "two"})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_drag_duration_garbage_is_invalid_params(self, monkeypatch):
+        self._pa(monkeypatch)
+        from hermes_mac_agent.daemon.tools import ToolError, tool_mouse_drag
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_drag({"x1": 1, "y1": 1, "x2": 2, "y2": 2, "duration": "slow"})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_bool_is_not_a_number(self, monkeypatch):
+        self._pa(monkeypatch)
+        from hermes_mac_agent.daemon.tools import ToolError, tool_mouse_click
+
+        with pytest.raises(ToolError) as exc:
+            tool_mouse_click({"clicks": True})
+        assert exc.value.code == INVALID_PARAMS
+
+    def test_pyautogui_failsafe_disabled_by_daemon(self, monkeypatch):
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        stub = types.SimpleNamespace(FAILSAFE=True, PAUSE=0.1)
+        monkeypatch.setitem(sys.modules, "pyautogui", stub)
+        tools._pyautogui()
+        assert stub.FAILSAFE is False
+        assert stub.PAUSE == 0

@@ -161,7 +161,49 @@ def _pyautogui():
         import pyautogui
     except Exception as exc:  # pragma: no cover - import failure
         raise ToolError(INTERNAL_ERROR, f"pyautogui unavailable: {exc}") from exc
+    # pyautogui's failsafe raises FailSafeException when an action targets
+    # (0,0)..(FAILSAFEPOINT,FAILSAFEPOINT). For an interactive desktop script
+    # it's an escape hatch; for a *headless remote daemon* it is a pure defect:
+    # the Apple menu and hot-corner controls live at x=0, so legitimate clicks
+    # there (a) die with an opaque INTERNAL_ERROR after earlier events of the
+    # same call already executed (e.g. mouse_drag moveTo's to (0,0), *raises
+    # mid-drag* and leaves pyautogui holding the mouse button), and (b) there
+    # is no operator with Ctrl+C on that machine to abort anything anyway.
+    # PAUSE is likewise dead weight: the daemon is strictly sequential.
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
     return pyautogui
+
+
+# ---------------------------------------------------------------------------
+# Param coercion
+# ---------------------------------------------------------------------------
+
+
+def _num_int(params: dict[str, Any], name: str, default: int) -> int:
+    """int param tolerating numeric JSON (2.0) and numeric strings.
+
+    A raw int()/float() TypeError/ValueError escaping a handler surfaces as
+    INTERNAL_ERROR, which agents (correctly) treat as a daemon fault and
+    retry forever. Bad parameter values must answer INVALID_PARAMS.
+    """
+    val = params.get(name, default)
+    if isinstance(val, bool):
+        raise ToolError(INVALID_PARAMS, f"'{name}' must be a number, got {val!r}")
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        raise ToolError(INVALID_PARAMS, f"'{name}' must be a number, got {val!r}") from None
+
+
+def _num_float(params: dict[str, Any], name: str, default: float) -> float:
+    val = params.get(name, default)
+    if isinstance(val, bool):
+        raise ToolError(INVALID_PARAMS, f"'{name}' must be a number, got {val!r}")
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        raise ToolError(INVALID_PARAMS, f"'{name}' must be a number, got {val!r}") from None
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +332,7 @@ def _resolve_point(params: dict[str, Any], x_name: str = "x", y_name: str = "y")
 
 
 def tool_mouse_move(params: dict[str, Any]) -> dict[str, Any]:
-    duration = float(params.get("duration", 0.0))
+    duration = _num_float(params, "duration", 0.0)
     px, py = _resolve_point(params, "x", "y")  # validates + converts before TCC
     _require_accessibility()
     _pyautogui().moveTo(px, py, duration=duration)
@@ -303,7 +345,7 @@ def tool_mouse_click(params: dict[str, Any]) -> dict[str, Any]:
     if (x is None) != (y is None):
         raise ToolError(INVALID_PARAMS, "'x' and 'y' must be provided together")
     button = _validate_button(params.get("button", "left"))
-    clicks = int(params.get("clicks", 1))
+    clicks = _num_int(params, "clicks", 1)
     if clicks < 1:
         raise ToolError(INVALID_PARAMS, "'clicks' must be >= 1")
     if x is not None:
@@ -319,7 +361,7 @@ def tool_mouse_click(params: dict[str, Any]) -> dict[str, Any]:
 
 def tool_mouse_drag(params: dict[str, Any]) -> dict[str, Any]:
     button = _validate_button(params.get("button", "left"))
-    duration = float(params.get("duration", 0.5))
+    duration = _num_float(params, "duration", 0.5)
     x1, y1 = _resolve_point(params, "x1", "y1")  # validates + converts before TCC
     x2, y2 = _resolve_point(params, "x2", "y2")
     _require_accessibility()
@@ -333,8 +375,8 @@ def tool_mouse_drag(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def tool_mouse_scroll(params: dict[str, Any]) -> dict[str, Any]:
-    dx = int(params.get("dx", 0))
-    dy = int(params.get("dy", 0))
+    dx = _num_int(params, "dx", 0)
+    dy = _num_int(params, "dy", 0)
     _require_accessibility()
     pa = _pyautogui()
     if dy:
@@ -352,23 +394,89 @@ def tool_type_text(params: dict[str, Any]) -> dict[str, Any]:
     text = params.get("text")
     if not isinstance(text, str):
         raise ToolError(INVALID_PARAMS, "'text' must be a string")
-    interval = float(params.get("interval", 0.0))
+    interval = _num_float(params, "interval", 0.0)
     _require_accessibility()
     _pyautogui().write(text, interval=interval)
     return {"ok": True}
 
 
+#: Spellings agents habitually use that pyautogui rejects, mapped to the
+#: name it accepts (applied case-insensitively BEFORE validation). The
+#: authoritative vocabulary is pyautogui's own KEY_NAMES (~194 entries on
+#: macOS, incl. 'esc', 'del', 'pgup', single punctuation chars) — validated
+#: against the live table in _validate_key, never a static copy that can
+#: drift out of sync.
+_KEY_ALIASES = {
+    "cmd": "command",
+    "cmdkey": "command",
+    "meta": "command",
+    "super": "command",
+    "windows": "command",
+    "control": "ctrl",
+    "opt": "option",
+    "volume_mute": "volumemute",
+    "mute": "volumemute",
+}
+
+
+def _validate_key(name: Any, valid_names: frozenset[str] | None) -> str:
+    if not isinstance(name, str) or not name:
+        raise ToolError(INVALID_PARAMS, "every key name must be a non-empty string")
+    key = name.strip().lower()
+    if "+" in key:
+        raise ToolError(
+            INVALID_PARAMS,
+            f"key {name!r} looks like a combo; pass each key as its own "
+            "element, e.g. keys=[\"command\", \"c\"]",
+        )
+    key = _KEY_ALIASES.get(key, key)
+    if valid_names is not None and key not in valid_names:
+        import difflib
+
+        close = difflib.get_close_matches(key, sorted(valid_names), n=3)
+        hint = f" — did you mean {', '.join(repr(c) for c in close)}?" if close else ""
+        raise ToolError(
+            INVALID_PARAMS,
+            f"unknown key name {name!r}{hint}; see SKILL.md for key names",
+        )
+    return key
+
+
+def _key_valid_names(pa) -> frozenset[str] | None:
+    """Live pyautogui key vocabulary + aliases; None if not introspectable."""
+    names = getattr(pa, "KEY_NAMES", None)
+    if not names:
+        return None
+    return frozenset(names) | frozenset(_KEY_ALIASES.values())
+
+
 def tool_key_press(params: dict[str, Any]) -> dict[str, Any]:
     keys = params.get("keys")
-    if not isinstance(keys, list) or not keys or not all(isinstance(k, str) and k for k in keys):
+    if not isinstance(keys, list) or not keys:
         raise ToolError(INVALID_PARAMS, "'keys' must be a non-empty list of key names")
+    # Structural validation (types, combos, aliases) runs first — it needs no
+    # pyautogui, so malformed parameters never reach the GUI layer at all.
+    keys = [_validate_key(k, None) for k in keys]
     _require_accessibility()
     pa = _pyautogui()
+    # Membership validation against pyautogui's live vocabulary (when
+    # introspectable) turns unknown spellings into INVALID_PARAMS + hint
+    # instead of an obscure FindKeyError.
+    valid = _key_valid_names(pa)
+    if valid is not None:
+        keys = [_validate_key(k, valid) for k in keys]
     # A single key is a press; a combination is a simultaneous hotkey.
-    if len(keys) == 1:
-        pa.press(keys[0])
-    else:
-        pa.hotkey(*keys)
+    # FindKeyError (key accepted by us but unknown to pyautogui — only
+    # reachable when KEY_NAMES introspection fails) is a parameter fault,
+    # not a daemon fault: report INVALID_PARAMS with a clear message.
+    find_key_error = getattr(pa, "FindKeyError", ())
+    try:
+        if len(keys) == 1:
+            pa.press(keys[0])
+        else:
+            pa.hotkey(*keys)
+    except find_key_error as exc:
+        raise ToolError(INVALID_PARAMS, f"key not supported: {exc}") from exc
     return {"ok": True}
 
 
