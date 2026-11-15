@@ -56,6 +56,24 @@ def _quiet_sleeps(monkeypatch, record=None):
     monkeypatch.setattr(tools.time, "sleep", _sleep)
 
 
+def _no_quartz(monkeypatch):
+    """Force _post_button's pyautogui fallback so NO real CGEvent is posted.
+
+    On macOS ``import Quartz`` really succeeds, so an unstubbed _quartz in a
+    click test would create AND POST real input events to the live HID tap
+    (found running the suite on the test laptop). Tests that assert on
+    pa.mouseDown/mouseUp must pin this path; the real poster is covered by
+    TestEventPipelineHygiene with a fake Quartz.
+    """
+    from hermes_mac_agent.daemon import tools
+    from hermes_mac_agent.protocol import INTERNAL_ERROR
+
+    def _raise():
+        raise tools.ToolError(INTERNAL_ERROR, "Quartz unavailable (test)")
+
+    monkeypatch.setattr(tools, "_quartz", _raise)
+
+
 def _position_from_moves(calls):
     """pyautogui.position() stub: the cursor 'is' where the last moveTo put it."""
 
@@ -317,6 +335,7 @@ class TestGuiBehavior:
         monkeypatch.setitem(sys.modules, "pyautogui", stub)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
         _quiet_sleeps(monkeypatch)
+        _no_quartz(monkeypatch)
         return calls
 
     def test_mouse_drag_is_absolute(self, monkeypatch):
@@ -975,6 +994,7 @@ class TestParamCoercion:
         monkeypatch.setitem(sys.modules, "pyautogui", stub)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
         _quiet_sleeps(monkeypatch)
+        _no_quartz(monkeypatch)
         return calls
 
     def test_scroll_numeric_string_accepted(self, monkeypatch):
@@ -1072,6 +1092,7 @@ class TestInputPacing:
         monkeypatch.setitem(sys.modules, "pyautogui", stub)
         monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
         monkeypatch.setattr(tools.time, "sleep", sleeps.append)
+        _no_quartz(monkeypatch)
         return calls, sleeps
 
     # --- click -------------------------------------------------------------
