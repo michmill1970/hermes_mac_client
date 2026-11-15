@@ -172,6 +172,15 @@ def _pyautogui():
     # PAUSE is likewise dead weight: the daemon is strictly sequential.
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0
+    # fn-latch fix (see the event-pipeline hygiene note): pyautogui's
+    # NULL-source keyboard events inherit the session's modifier flags;
+    # install once, keep going on platforms without Quartz.
+    try:
+        import Quartz
+
+        install_keyboard_source_hook(Quartz)
+    except ImportError:  # pragma: no cover - only on non-macOS
+        pass
     return pyautogui
 
 
@@ -269,6 +278,115 @@ KEY_SETTLE = 0.02       # keyDown -> keyUp (and chord key gaps)
 TYPE_INTERVAL_FLOOR = 0.02   # minimum per-character interval for type_text
 ACTION_TAIL = 0.03      # after the last event of a call, so the next call's
                         # events start on a quiet pipeline
+
+
+# ---------------------------------------------------------------------------
+# Event-pipeline hygiene: clean keyboard event source + real double-clicks
+# ---------------------------------------------------------------------------
+#
+# Two defects measured on the test laptop (2026-11-14), both invisible in the
+# RPC reply but fatal to reliability:
+#
+# 1. fn/Globe latch. pyautogui creates keyboard events with
+#    CGEventCreateKeyboardEvent(NULL, ...); a NULL-source event takes its
+#    modifier flags from the live HID session state. Measured: on a session
+#    whose flags carry the fn bit, every modifier chord posted that way
+#    re-asserted fn at the HID source (40/40 chords latched; watcher caught
+#    'Cmd up' and 'fn down' in the same millisecond). A latched fn hijacks
+#    later typing through the system input method (Globe action) and turns
+#    the wheel horizontal. The same chords created from an explicit
+#    CGEventSource latched 0/40 AND were fully functional (uppercase
+#    keystrokes and Cmd+A selections confirmed via page beacons), so the
+#    daemon routes every NULL-source keyboard event through one dedicated
+#    combined-session source. pyautogui's key mapping/vocabulary is untouched
+#    — only the event source changes.
+#
+# 2. double-click never pairs. pyautogui's mouseDown/mouseUp never sets
+#    kCGMouseEventClickState, so clicks=2 is two independent single clicks
+#    that macOS never pairs: 123 measured click pairs produced ZERO dblclick
+#    events (e.detail always 1) — word-select, open-by-double-click, and
+#    detail>=2 handling were all silently dead in every app. The daemon posts
+#    button events itself, tagging both halves of click #N with state N.
+
+#: Dedicated CGEventSource for all synthesized input (lazy, see _event_source).
+_EVENT_SRC: Any = None
+
+#: button -> (down-kind attr, up-kind attr, cg-button attr) on the Quartz module
+_BUTTON_EVENTS = {
+    "left": ("kCGEventLeftMouseDown", "kCGEventLeftMouseUp", "kCGMouseButtonLeft"),
+    "right": ("kCGEventRightMouseDown", "kCGEventRightMouseUp", "kCGMouseButtonRight"),
+    "middle": ("kCGEventOtherMouseDown", "kCGEventOtherMouseUp", "kCGMouseButtonMiddle"),
+}
+
+
+def _quartz():
+    try:
+        import Quartz
+    except ImportError as exc:  # pragma: no cover - only on non-macOS
+        raise ToolError(INTERNAL_ERROR, f"Quartz unavailable: {exc}") from exc
+    return Quartz
+
+
+def _event_source(quartz):
+    global _EVENT_SRC
+    if _EVENT_SRC is None:
+        _EVENT_SRC = quartz.CGEventSourceCreate(
+            quartz.kCGEventSourceStateCombinedSessionState
+        )
+    return _EVENT_SRC
+
+
+def install_keyboard_source_hook(quartz) -> bool:
+    """Route NULL-source keyboard CGEvents through a clean event source.
+
+    pyautogui resolves ``Quartz.CGEventCreateKeyboardEvent`` via the Quartz
+    module at call time, so replacing that attribute covers every keyboard
+    path pyautogui has (keyDown/keyUp/press/typewrite/write) without
+    reimplementing its key mapping. Idempotent across daemon restarts and
+    module reloads within one process; explicit sources pass through.
+    Returns True if THIS call installed the hook.
+    """
+    if getattr(quartz, "_hermes_kbd_hook", False):
+        return False
+    original = quartz.CGEventCreateKeyboardEvent
+
+    def _create(source, virtual_key, is_down):
+        if source is None:
+            source = _event_source(quartz)
+        return original(source, virtual_key, is_down)
+
+    quartz.CGEventCreateKeyboardEvent = _create
+    quartz._hermes_kbd_hook = True
+    return True
+
+
+def _post_button(pa, button: str, down: bool, click_state: int) -> None:
+    """Post one mouse-button half-event tagged with its click sequence number.
+
+    The click state (kCGMouseEventClickState) is what lets macOS pair two
+    rapid clicks into a real double-click — see the note above. Events carry
+    the current cursor position, like pyautogui's own button posts.
+    """
+    try:
+        quartz = _quartz()
+    except ToolError:
+        # Only reachable where Quartz is absent: pyautogui itself
+        # hard-requires Quartz on macOS, so any Mac that reaches here has
+        # it. Non-macOS dev/test falls back to pyautogui's plain button.
+        (pa.mouseDown if down else pa.mouseUp)(button=button)
+        return
+    down_kind, up_kind, cg_button = _BUTTON_EVENTS[button]
+    x, y = pa.position()
+    event = quartz.CGEventCreateMouseEvent(
+        _event_source(quartz),
+        getattr(quartz, down_kind if down else up_kind),
+        (x, y),
+        getattr(quartz, cg_button),
+    )
+    quartz.CGEventSetIntegerValueField(
+        event, quartz.kCGMouseEventClickState, click_state
+    )
+    quartz.CGEventPost(quartz.kCGHIDEventTap, event)
 
 
 def _verify_cursor(pa, px: int, py: int) -> None:
@@ -448,11 +566,14 @@ def tool_mouse_click(params: dict[str, Any]) -> dict[str, Any]:
         pa.moveTo(px, py)
         _verify_cursor(pa, px, py)
     # Manual down/up so the button has a real hold time (pa.click posts
-    # down+up back-to-back; some apps' hit-testing drops zero-width presses).
+    # down+up back-to-back; some apps' hit-testing drops zero-width presses)
+    # AND carries an explicit click state — pyautogui's own mouseDown/mouseUp
+    # never sets it, so clicks=2 through pa would never pair as a
+    # double-click (see the event-pipeline hygiene note).
     for i in range(clicks):
-        pa.mouseDown(button=button)
+        _post_button(pa, button, True, i + 1)
         time.sleep(CLICK_PRESS)
-        pa.mouseUp(button=button)
+        _post_button(pa, button, False, i + 1)
         if i + 1 < clicks:
             time.sleep(CLICK_MULTI_GAP)
     time.sleep(ACTION_TAIL)

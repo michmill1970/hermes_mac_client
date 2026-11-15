@@ -1192,3 +1192,175 @@ class TestInputPacing:
         tool_mouse_click({"x": round(983 / 1792, 5), "y": round(396 / 1120, 5)})
         move = next(c for c in calls if c[0] == "moveTo")
         assert move[1] == (983, 396)
+
+
+class TestEventPipelineHygiene:
+    """Clean keyboard event source (fn-latch) + real double-clicks (click state).
+
+    Both defects measured on macbookpro-i9 (2026-11-14):
+    - NULL-source chords (what pyautogui posts) re-assert the fn bit at the
+      HID source: 40/40 chords latched fn, 0/40 from an explicit
+      CGEventSource (and the source events were fully functional — keystrokes
+      and selections confirmed via page beacons).
+    - pyautogui's mouseDown/mouseUp never sets kCGMouseEventClickState:
+      123 measured click pairs produced zero dblclick events (e.detail always
+      1), so clicks=2 was never a double-click in any app.
+    """
+
+    def _fake_quartz(self, monkeypatch):
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        created, posts = [], []
+
+        def _create_mouse(source, kind, pt, btn):
+            evt = ["mouse", kind, pt, btn, source]
+            created.append(evt)
+            return evt
+
+        def _create_kbd(source, key, down):
+            evt = ["kbd", key, down, source]
+            created.append(evt)
+            return evt
+
+        qz = types.SimpleNamespace(
+            CGEventCreateMouseEvent=_create_mouse,
+            CGEventCreateKeyboardEvent=_create_kbd,
+            CGEventSourceCreate=lambda state: created.append(
+                ["source", state]) or "SRC",
+            CGEventSetIntegerValueField=lambda evt, field, val: created.append(
+                ["field", evt, field, val]),
+            CGEventPost=lambda tap, evt: posts.append((tap, evt)),
+            kCGEventSourceStateCombinedSessionState=1,
+            kCGMouseEventClickState=99,
+            kCGHIDEventTap=0,
+            kCGEventLeftMouseDown=1, kCGEventLeftMouseUp=2,
+            kCGMouseButtonLeft=0,
+            kCGEventRightMouseDown=3, kCGEventRightMouseUp=4,
+            kCGMouseButtonRight=1,
+            kCGEventOtherMouseDown=5, kCGEventOtherMouseUp=6,
+            kCGMouseButtonMiddle=2,
+        )
+        monkeypatch.setattr(tools, "_quartz", lambda: qz)
+        monkeypatch.setattr(tools, "_EVENT_SRC", None)
+        return qz, created, posts
+
+    def _fake_pa(self, monkeypatch):
+        import types
+
+        calls = []
+
+        def _rec(name):
+            def _fn(*a, **k):
+                calls.append((name, a, k))
+            return _fn
+
+        pa = types.SimpleNamespace(
+            moveTo=_rec("moveTo"), position=lambda: (5, 5),
+            mouseDown=_rec("mouseDown"), mouseUp=_rec("mouseUp"),
+        )
+        for n in ("keyDown", "keyUp"):
+            setattr(pa, n, _rec(n))
+        pa.FAILSAFE = pa.PAUSE = None
+        return pa, calls
+
+    # --- keyboard source hook (fn-latch fix) --------------------------------
+
+    def test_pyautogui_import_installs_the_hook(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        qz, created, _ = self._fake_quartz(monkeypatch)
+        pa, _ = self._fake_pa(monkeypatch)
+        monkeypatch.setitem(sys.modules, "pyautogui", pa)
+        monkeypatch.setitem(sys.modules, "Quartz", qz)
+
+        assert tools._pyautogui() is pa
+        assert qz._hermes_kbd_hook is True
+
+    def test_hook_routes_null_source_to_clean_source(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        qz, created, _ = self._fake_quartz(monkeypatch)
+        assert tools.install_keyboard_source_hook(qz) is True
+        assert tools.install_keyboard_source_hook(qz) is False  # idempotent
+
+        qz.CGEventCreateKeyboardEvent(None, 56, True)   # pa's NULL-source call
+        qz.CGEventCreateKeyboardEvent("explicit", 56, False)
+
+        assert created[0] == ["source", qz.kCGEventSourceStateCombinedSessionState]
+        assert created[1][3] == "SRC"          # NULL replaced by our source
+        assert created[2][3] == "explicit"     # explicit source passes through
+
+    def test_hook_survives_pa_keydown_call_shape(self, monkeypatch):
+        # The wrapper must keep pa's exact 3-positional-arg call signature.
+        from hermes_mac_agent.daemon import tools
+
+        qz, created, _ = self._fake_quartz(monkeypatch)
+        tools.install_keyboard_source_hook(qz)
+        qz.CGEventCreateKeyboardEvent(None, 0, True)   # keyDown('a') shape
+        assert created[1][:3] == ["kbd", 0, True]
+
+    # --- button click state (double-click fix) -------------------------------
+
+    def test_double_click_tags_both_halves_with_click_state(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        _, created, posts = self._fake_quartz(monkeypatch)
+        pa, _ = self._fake_pa(monkeypatch)
+        monkeypatch.setattr(tools, "_pyautogui", lambda: pa)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+
+        tools.tool_mouse_click({"x": 5, "y": 5, "clicks": 2})
+
+        kinds = [c[1] for c in created if c[0] == "mouse"]
+        assert kinds == [
+            1, 2, 1, 2,  # LeftDown, LeftUp, LeftDown, LeftUp
+        ]
+        states = [c[3] for c in created if c[0] == "field"]
+        assert states == [1, 1, 2, 2]  # down+up of click 1, then of click 2
+        assert all(c[4] == "SRC" for c in created if c[0] == "mouse")
+        assert [posts[i][1][0] for i in range(4)] == ["mouse"] * 4
+        assert [posts[i][0] for i in range(4)] == [0] * 4  # posted to HID tap
+
+    def test_third_click_state_increments(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        _, created, _ = self._fake_quartz(monkeypatch)
+        pa, _ = self._fake_pa(monkeypatch)
+        monkeypatch.setattr(tools, "_pyautogui", lambda: pa)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+
+        tools.tool_mouse_click({"x": 5, "y": 5, "clicks": 3})
+        assert [c[3] for c in created if c[0] == "field"] == [1, 1, 2, 2, 3, 3]
+
+    def test_right_button_uses_right_event_kinds(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        _, created, _ = self._fake_quartz(monkeypatch)
+        pa, _ = self._fake_pa(monkeypatch)
+        monkeypatch.setattr(tools, "_pyautogui", lambda: pa)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+
+        tools.tool_mouse_click({"x": 5, "y": 5, "button": "right"})
+        kinds = [c[1] for c in created if c[0] == "mouse"]
+        assert kinds == [3, 4]  # RightDown, RightUp
+
+    def test_no_quartz_falls_back_to_pyautogui_button(self, monkeypatch):
+        # Non-macOS dev/test only (pyautogui hard-requires Quartz on macOS):
+        # clicks must still work, just without CG-level click state.
+        from hermes_mac_agent.daemon import tools
+        from hermes_mac_agent.protocol import INTERNAL_ERROR
+
+        def _raise():
+            raise tools.ToolError(INTERNAL_ERROR, "Quartz unavailable")
+
+        monkeypatch.setattr(tools, "_quartz", _raise)
+        pa, calls = self._fake_pa(monkeypatch)
+        monkeypatch.setattr(tools, "_pyautogui", lambda: pa)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+
+        tools.tool_mouse_click({"x": 5, "y": 5, "clicks": 2})
+        assert [c[0] for c in calls if c[0].startswith("mouse")] == [
+            "mouseDown", "mouseUp", "mouseDown", "mouseUp",
+        ]
