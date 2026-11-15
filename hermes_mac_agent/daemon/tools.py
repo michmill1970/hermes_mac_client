@@ -19,6 +19,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -360,6 +361,109 @@ def install_keyboard_source_hook(quartz) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Input ledger — self-bookkeeping of events the daemon posts
+# ---------------------------------------------------------------------------
+# This class reads NOTHING: no app state, no system state, no API beyond
+# counting the daemon's own actions, so it adds zero permission surface.
+# Rationale: a key-up lost mid-posting (OS queue under load, or a write()
+# aborted mid-string that was holding an implicit shift) leaves a REAL
+# modifier pressed at the HID layer, and the next ordinary keystroke then
+# fires a system hotkey (Dictation, Character Viewer) with focus-stealing
+# consequences — invisible to whoever posted it unless the daemon keeps
+# its own down/up balance. ``input_state()`` exposes that balance.
+
+#: cap on the anomaly log returned by input_state() (most recent kept).
+LEDGER_LOG_LIMIT = 20
+
+
+class _InputLedger:
+    def __init__(self) -> None:
+        # Handlers run via asyncio.to_thread and several clients may post
+        # input concurrently, so every mutation is lock-guarded.
+        self._lock = threading.Lock()
+        self._down: dict[str, int] = {}
+        self._suspect: dict[str, str] = {}
+        self._log: list[dict[str, Any]] = []
+        self.typed_chars = 0
+        self.last_chord: list[str] | None = None
+
+    def reset(self) -> None:
+        """Clear all state (test support)."""
+        with self._lock:
+            self._down.clear()
+            self._suspect.clear()
+            self._log.clear()
+            self.typed_chars = 0
+            self.last_chord = None
+
+    def _note_locked(self, event: str, **fields: Any) -> None:
+        self._log.append({"event": event, "t": round(time.monotonic(), 3), **fields})
+        del self._log[:-LEDGER_LOG_LIMIT]
+
+    def note(self, event: str, **fields: Any) -> None:
+        with self._lock:
+            self._note_locked(event, **fields)
+
+    def down(self, key: str) -> None:
+        with self._lock:
+            self._down[key] = self._down.get(key, 0) + 1
+
+    def up(self, key: str) -> None:
+        with self._lock:
+            was_suspect = self._suspect.pop(key, None) is not None
+            if was_suspect:
+                # This keyUp posted successfully for a key whose release had
+                # previously failed or was unknown: direct evidence the OS key
+                # is no longer held. Zero any stale ledger debt on it — an
+                # alarm the agent cannot clear becomes noise the agent
+                # ignores.
+                self._down.pop(key, None)
+                self._note_locked("resettled", key=key)
+                return
+            n = self._down.get(key, 0)
+            if n <= 0:
+                # keyUp recorded with no matching keyDown: a bookkeeping
+                # break, never a negative count (which would mask the next
+                # genuine leak).
+                self._note_locked("unbalanced_key_up", key=key)
+                return
+            if n == 1:
+                del self._down[key]
+            else:
+                self._down[key] = n - 1
+
+    def suspect(self, key: str, why: str) -> None:
+        with self._lock:
+            self._suspect[key] = why
+            self._note_locked("suspect", key=key, why=why)
+
+    def typed(self, n: int) -> None:
+        with self._lock:
+            self.typed_chars += n
+
+    def chord(self, keys: list[str]) -> None:
+        with self._lock:
+            self.last_chord = list(keys)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                # Keys the daemon pressed down and has NOT seen released.
+                # Non-empty here == stuck-modifier hazard from daemon
+                # events; 'suspect' lists keys whose release failed or
+                # whose state is unknown (aborted mid-string typing).
+                "held": dict(self._down),
+                "suspect": dict(self._suspect),
+                "typed_chars": self.typed_chars,
+                "last_chord": self.last_chord,
+                "log": list(self._log),
+            }
+
+
+_LEDGER = _InputLedger()
+
+
 def _post_button(pa, button: str, down: bool, click_state: int) -> None:
     """Post one mouse-button half-event tagged with its click sequence number.
 
@@ -367,26 +471,43 @@ def _post_button(pa, button: str, down: bool, click_state: int) -> None:
     rapid clicks into a real double-click — see the note above. Events carry
     the current cursor position, like pyautogui's own button posts.
     """
+    key = f"button:{button}"
+    if down:
+        _LEDGER.down(key)
+    posted = False
     try:
-        quartz = _quartz()
-    except ToolError:
-        # Only reachable where Quartz is absent: pyautogui itself
-        # hard-requires Quartz on macOS, so any Mac that reaches here has
-        # it. Non-macOS dev/test falls back to pyautogui's plain button.
-        (pa.mouseDown if down else pa.mouseUp)(button=button)
-        return
-    down_kind, up_kind, cg_button = _BUTTON_EVENTS[button]
-    x, y = pa.position()
-    event = quartz.CGEventCreateMouseEvent(
-        _event_source(quartz),
-        getattr(quartz, down_kind if down else up_kind),
-        (x, y),
-        getattr(quartz, cg_button),
-    )
-    quartz.CGEventSetIntegerValueField(
-        event, quartz.kCGMouseEventClickState, click_state
-    )
-    quartz.CGEventPost(quartz.kCGHIDEventTap, event)
+        try:
+            quartz = _quartz()
+        except ToolError:
+            # Only reachable where Quartz is absent: pyautogui itself
+            # hard-requires Quartz on macOS, so any Mac that reaches here has
+            # it. Non-macOS dev/test falls back to pyautogui's plain button.
+            (pa.mouseDown if down else pa.mouseUp)(button=button)
+            posted = True
+        else:
+            down_kind, up_kind, cg_button = _BUTTON_EVENTS[button]
+            x, y = pa.position()
+            event = quartz.CGEventCreateMouseEvent(
+                _event_source(quartz),
+                getattr(quartz, down_kind if down else up_kind),
+                (x, y),
+                getattr(quartz, cg_button),
+            )
+            quartz.CGEventSetIntegerValueField(
+                event, quartz.kCGMouseEventClickState, click_state
+            )
+            quartz.CGEventPost(quartz.kCGHIDEventTap, event)
+            posted = True
+    except Exception:
+        if down and not posted:
+            _LEDGER.up(key)  # nothing reached the OS; balance the book
+        elif not down:
+            # A half-posted release is a stuck-button hazard, not a clean
+            # release: leave the ledger down and flag it.
+            _LEDGER.suspect(key, "button_up_failed")
+        raise
+    if not down:
+        _LEDGER.up(key)
 
 
 def _verify_cursor(pa, px: int, py: int) -> None:
@@ -416,12 +537,27 @@ def _verify_cursor(pa, px: int, py: int) -> None:
 
 
 def _press_paced(pa, key: str) -> None:
-    """One key down/up with the settle gap; keyUp is finally-safe."""
-    pa.keyDown(key)
+    """One key down/up with the settle gap; keyUp is finally-safe.
+
+    Ledgered: a keyDown whose keyUp failed (or never ran) is exactly the
+    stuck-modifier hazard class, so the ledger records it as SUSPECT /
+    still-held instead of assuming balance.
+    """
+    _LEDGER.down(key)
+    try:
+        pa.keyDown(key)
+    except Exception:
+        _LEDGER.up(key)  # nothing reached the OS; balance the book
+        raise
     try:
         time.sleep(KEY_SETTLE)
     finally:
-        pa.keyUp(key)
+        try:
+            pa.keyUp(key)
+        except Exception:
+            _LEDGER.suspect(key, "key_up_failed")
+            raise
+        _LEDGER.up(key)
 
 
 def _hotkey_paced(pa, keys: list[str]) -> None:
@@ -430,17 +566,36 @@ def _hotkey_paced(pa, keys: list[str]) -> None:
     Every pressed modifier is released even if the final key's events raise —
     a leaked modifier keyUp poisons ALL later input (stuck-modifier
     hotkeys), so release runs in finally, never on the happy path only.
+    One modifier's failed release must not strand the REST of the releases
+    (the original code's first failure in the finally loop did), so failures
+    are collected: every modifier still gets its keyUp posted, every failure
+    is ledgered, and the first error is re-raised after the loop.
     """
+    _LEDGER.chord(keys)
     held: list[str] = []
     try:
         for mod in keys[:-1]:
-            pa.keyDown(mod)
+            _LEDGER.down(mod)
+            try:
+                pa.keyDown(mod)
+            except Exception:
+                _LEDGER.up(mod)  # nothing reached the OS; balance the book
+                raise
             held.append(mod)
             time.sleep(KEY_SETTLE)
         _press_paced(pa, keys[-1])
     finally:
+        first_err: Exception | None = None
         for mod in reversed(held):
-            pa.keyUp(mod)
+            try:
+                pa.keyUp(mod)
+            except Exception as exc:
+                _LEDGER.suspect(mod, "key_up_failed")
+                first_err = first_err or exc
+                continue
+            _LEDGER.up(mod)
+        if first_err is not None:
+            raise first_err
 
 
 # ---------------------------------------------------------------------------
@@ -628,7 +783,18 @@ def tool_type_text(params: dict[str, Any]) -> dict[str, Any]:
     if interval < TYPE_INTERVAL_FLOOR:
         interval = TYPE_INTERVAL_FLOOR
     _require_accessibility()
-    _pyautogui().write(text, interval=interval)
+    try:
+        _pyautogui().write(text, interval=interval)
+    except Exception as exc:
+        # write() aborts mid-string: the interrupted character's key-up —
+        # or the implicit SHIFT it was holding for a capital/unicode char —
+        # may never have posted. The abort point is unknowable from here,
+        # and a stuck shift is a system-hotkey hazard, so flag shift
+        # conservatively (a later real release clears the suspicion).
+        _LEDGER.suspect("shift", "type_text_aborted_mid_string")
+        _LEDGER.note("type_text_aborted", length=len(text))
+        raise ToolError(INTERNAL_ERROR, f"type_text interrupted: {exc}") from exc
+    _LEDGER.typed(len(text))
     time.sleep(ACTION_TAIL)
     return {"ok": True}
 
@@ -713,6 +879,19 @@ def tool_key_press(params: dict[str, Any]) -> dict[str, Any]:
         raise ToolError(INVALID_PARAMS, f"key not supported: {exc}") from exc
     time.sleep(ACTION_TAIL)
     return {"ok": True}
+
+
+def tool_input_state(params: dict[str, Any]) -> dict[str, Any]:
+    """The daemon's self-assessment of input IT posted — no system reads.
+
+    ``held`` lists keys/buttons pressed down and never seen released and
+    ``suspect`` keys whose release failed or is unknown (aborted typing).
+    Either non-empty means later keystrokes may fire unintended system
+    hotkeys: release the listed keys with key_press (or restart the
+    daemon) before trusting input. Agents should check this after a
+    chord/typing error and before sensitive sequences.
+    """
+    return {"ok": True, **_LEDGER.snapshot()}
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1288,7 @@ def build_tools(config: Config, start_time: float, tracker: Any = None) -> dict[
         "mouse_scroll": tool_mouse_scroll,
         "type_text": tool_type_text,
         "key_press": tool_key_press,
+        "input_state": tool_input_state,
         "launch_app": lambda p: tool_launch_app(p, config),
         "run_command": lambda p: tool_run_command(p, config),
         "list_processes": tool_list_processes,

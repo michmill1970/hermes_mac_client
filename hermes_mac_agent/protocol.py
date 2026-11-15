@@ -52,6 +52,7 @@ class Method(str, Enum):
     MOUSE_SCROLL = "mouse_scroll"
     TYPE_TEXT = "type_text"
     KEY_PRESS = "key_press"
+    INPUT_STATE = "input_state"
     LAUNCH_APP = "launch_app"
     RUN_COMMAND = "run_command"
     LIST_PROCESSES = "list_processes"

@@ -162,6 +162,13 @@ def build_mcp_server():
         return "ok"
 
     @mcp.tool()
+    def input_state() -> str:
+        """Daemon's ledger of its own posted input. Non-empty 'held' or
+        'suspect' == possibly stuck modifiers: release them with key_press
+        before further typing."""
+        return str(agent.input_state())
+
+    @mcp.tool()
     def launch_app(app: str, url: str | None = None) -> str:
         """Launch a GUI app by name (e.g. 'Safari') or .app path, optionally opening a URL."""
         pid = agent.launch_app(app, url=url)

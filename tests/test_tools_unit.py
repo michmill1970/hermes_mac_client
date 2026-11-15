@@ -1385,3 +1385,184 @@ class TestEventPipelineHygiene:
         assert [c[0] for c in calls if c[0].startswith("mouse")] == [
             "mouseDown", "mouseUp", "mouseDown", "mouseUp",
         ]
+
+# ---------------------------------------------------------------------------
+# Input ledger (daemon self-bookkeeping; input_state RPC)
+# ---------------------------------------------------------------------------
+
+
+class TestInputLedger:
+    """The daemon must KNOW when it may have left a key pressed.
+
+    A lost key-up is a system-hotkey hazard (stuck ctrl/fn/shift turn the
+    next ordinary keystrokes into Dictation / Character Viewer). The ledger
+    tracks only events the daemon itself posted — these tests also pin that
+    it never goes negative and never self-clears an unposted release.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_ledger(self):
+        from hermes_mac_agent.daemon import tools
+
+        tools._LEDGER.reset()
+        yield
+        tools._LEDGER.reset()
+
+    def _stub(self, monkeypatch, fail=None):
+        """Stub pyautogui; *fail(name, args)* returns an Exception to raise."""
+        import types
+
+        from hermes_mac_agent.daemon import tools
+
+        calls = []
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                calls.append((name, args, kwargs))
+                if fail is not None:
+                    err = fail(name, args)
+                    if err is not None:
+                        raise err
+            return _fn
+
+        stub = types.SimpleNamespace()
+        for name in ("moveTo", "keyDown", "keyUp", "mouseDown", "mouseUp", "write"):
+            setattr(stub, name, _record(name))
+        stub.position = _position_from_moves(calls)
+        monkeypatch.setitem(sys.modules, "pyautogui", stub)
+        monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+        _quiet_sleeps(monkeypatch)
+        _no_quartz(monkeypatch)
+        return calls
+
+    def test_clean_chord_leaves_ledger_balanced(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        self._stub(monkeypatch)
+        tool_key_press({"keys": ["command", "a"]})
+        snap = tools._LEDGER.snapshot()
+        assert snap["held"] == {}
+        assert snap["suspect"] == {}
+        assert snap["last_chord"] == ["command", "a"]
+
+    def test_failed_modifier_release_is_held_and_suspect(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        def fail(name, args):
+            if name == "keyUp" and args and args[0] == "command":
+                return RuntimeError("post failed")
+            return None
+
+        self._stub(monkeypatch, fail)
+        with pytest.raises(RuntimeError):
+            tool_key_press({"keys": ["command", "c"]})
+        snap = tools._LEDGER.snapshot()
+        # The key is GONE in the OS (down posted, up never was): held +
+        # suspect, not silently balanced.
+        assert snap["held"].get("command") == 1
+        assert snap["suspect"].get("command") == "key_up_failed"
+
+    def test_body_failure_releases_every_modifier(self, monkeypatch):
+        # The middle key's keyDown fails mid-chord. Release of ALL held
+        # modifiers must still be posted (old code: a failing release in
+        # the finally loop stranded the rest).
+        from hermes_mac_agent.daemon import tools
+
+        def fail(name, args):
+            if name == "keyDown" and args and args[0] == "c":
+                return RuntimeError("mid-chord failure")
+            return None
+
+        calls = self._stub(monkeypatch, fail)
+        with pytest.raises(RuntimeError):
+            tool_key_press({"keys": ["command", "shift", "c"]})
+        seq = [(n, a[0] if a else None) for n, a, _ in calls]
+        assert ("keyUp", "shift") in seq and ("keyUp", "command") in seq
+        snap = tools._LEDGER.snapshot()
+        assert snap["held"] == {} and snap["suspect"] == {}
+
+    def test_type_text_abort_suspects_shift_until_released(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        def fail(name, args):
+            return RuntimeError("interrupted") if name == "write" else None
+
+        self._stub(monkeypatch, fail)
+        with pytest.raises(ToolError):
+            tool_type_text({"text": "Hello World"})
+        snap = tools._LEDGER.snapshot()
+        assert snap["suspect"].get("shift") == "type_text_aborted_mid_string"
+
+        # A later CLEAN release of shift proves it is not stuck: the
+        # suspicion must clear (no stale alarm).
+        self._stub(monkeypatch)
+        tool_key_press({"keys": ["shift"]})
+        assert tools._LEDGER.snapshot()["suspect"] == {}
+
+    def test_type_text_success_counts_chars(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        self._stub(monkeypatch)
+        tool_type_text({"text": "hello"})
+        snap = tools._LEDGER.snapshot()
+        assert snap["typed_chars"] == 5
+        assert snap["held"] == {} and snap["suspect"] == {}
+
+    def test_failed_button_up_is_suspect_and_held(self, monkeypatch):
+        from hermes_mac_agent.daemon import tools
+
+        def fail(name, args):
+            return RuntimeError("post failed") if name == "mouseUp" else None
+
+        self._stub(monkeypatch, fail)
+        with pytest.raises(RuntimeError):
+            tool_mouse_click({"x": 5, "y": 5})
+        snap = tools._LEDGER.snapshot()
+        assert snap["held"].get("button:left") == 1
+        assert snap["suspect"].get("button:left") == "button_up_failed"
+
+    def test_unbalanced_up_logs_and_never_goes_negative(self):
+        from hermes_mac_agent.daemon import tools
+
+        tools._LEDGER.up("ghost")  # keyUp with no recorded keyDown
+        snap = tools._LEDGER.snapshot()
+        assert snap["held"] == {}  # never negative
+        assert any(e["event"] == "unbalanced_key_up" for e in snap["log"])
+
+    def test_clean_release_clears_a_stuck_flag(self, monkeypatch):
+        # A key whose release once failed must be clearable: the recovery
+        # key_press that posts a real keyUp is evidence the OS key is up, so
+        # both 'suspect' and any stale 'held' debt on it must zero out —
+        # otherwise the alarm is permanent noise.
+        from hermes_mac_agent.daemon import tools
+
+        def fail(name, args):
+            if name == "keyUp" and args and args[0] == "command":
+                return RuntimeError("post failed")
+            return None
+
+        self._stub(monkeypatch, fail)
+        with pytest.raises(RuntimeError):
+            tool_key_press({"keys": ["command", "c"]})
+        assert tools._LEDGER.snapshot()["suspect"].get("command")
+
+        def fail_none(name, args):
+            return None
+
+        self._stub(monkeypatch, fail_none)
+        tool_key_press({"keys": ["command"]})  # recovery press
+        snap = tools._LEDGER.snapshot()
+        assert snap["held"] == {} and snap["suspect"] == {}
+        assert any(e["event"] == "resettled" for e in snap["log"])
+
+    def test_input_state_registered_and_reports(self, monkeypatch, config):
+        from hermes_mac_agent.daemon import tools
+
+        handlers = build_tools(config, 0.0)
+        assert "input_state" in handlers
+        self._stub(monkeypatch)
+        tools._LEDGER.suspect("shift", "type_text_aborted_mid_string")
+        result = handlers["input_state"]({})
+        assert result["ok"] is True
+        assert result["suspect"]["shift"] == "type_text_aborted_mid_string"
+        assert isinstance(result["log"], list)

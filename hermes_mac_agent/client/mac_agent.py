@@ -461,6 +461,19 @@ class MacAgent:
         """
         self._invoke("key_press", {"keys": keys})
 
+    def input_state(self) -> dict[str, Any]:
+        """The daemon's ledger of input IT posted (no app/system reads).
+
+        ``held`` = keys/buttons pressed down and never seen released,
+        ``suspect`` = keys whose release failed or is unknown (e.g. typing
+        aborted mid-string may have leaked the implicit shift). Either
+        non-empty means further keystrokes could fire unintended system
+        hotkeys: release the listed keys via ``key_press`` — or restart
+        the daemon — before trusting input. Check after any chord/typing
+        error and before sensitive sequences.
+        """
+        return self._invoke("input_state", {})
+
     # ------------------------------------------------------------------
     # Processes
     # ------------------------------------------------------------------

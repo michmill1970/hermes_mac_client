@@ -72,6 +72,7 @@ the connection drops.
 | `mouse_scroll(dx=0, dy=0)` | `None` | negative `dy` scrolls down; **targets the pane under the cursor** — move first |
 | `type_text(text, interval=0.0)` | `None` | `interval` per char in s; daemon floors it at ~0.02s (see Pacing) |
 | `key_press(keys)` | `None` | list of key names, e.g. `["command","shift","3"]` |
+| `input_state()` | `dict` | daemon's ledger of input **it** posted: `held`/`suspect` keys, `typed_chars`, `last_chord`, `log` — see Input self-diagnostics |
 | `launch_app(app, url=None)` | `int \| None` | pid if it could be found, else `None`. **Returns before the window exists** — see Pacing |
 | `run_command(cmd, cwd=None, timeout=60.0)` | `dict` | `{'exit_code','stdout','stderr'}` |
 | `list_processes(filter=None)` | `list[dict]` | **returns the list directly** |
@@ -131,6 +132,31 @@ means *events were delivered*, not that the UI reacted yet.
 - **After clicking into a new app/window, confirm focus** with a screenshot
   before `type_text` — keystrokes follow keyboard focus, which you do not
   control directly.
+- **Type in probe-then-commit order.** `type_text` returning `ok` only means
+  events were posted, not that they landed in the field you meant. Send the
+  first ~3 characters, take a screenshot to confirm *those* landed in the
+  target, then send the rest. A blind 26-character string that starts on the
+  wrong focus dumps 26 characters into whatever app actually had it; a 3-char
+  probe bounds the blast radius and tells you to stop before committing the
+  rest.
+
+### Input self-diagnostics (`input_state`)
+
+The usual cause of a sudden focus shift or "why did typing go haywire" is a
+**stuck modifier from a previous action** — a dropped key-up leaves Ctrl/Fn/Cmd
+physically held, and the next ordinary keystrokes then fire system hotkeys
+(Dictation, Character Viewer, Launchpad). The daemon keeps a ledger of the
+input **it** posted (no reads of app or system state) and exposes it via
+`input_state()`:
+
+- `held` — keys pressed down that were never seen released.
+- `suspect` — keys whose release failed or is unknown (e.g. typing aborted
+  mid-string may have leaked the implicit Shift for capitals).
+
+If either is non-empty, **do not continue typing**: release each listed key
+with a single `key_press([key])` (a clean release clears the flag), or restart
+the daemon. Check it after any chord/typing error, and before a sensitive
+sequence (passwords, sends, submits).
 
 ### Pacing (the daemon enforces floors; don't fight them)
 
